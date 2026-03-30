@@ -1,0 +1,46 @@
+Options -Indexes
+DirectoryIndex index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # History API reverse proxy (same-domain HTTPS -> local user service).
+  # Requires mod_proxy + mod_proxy_http enabled in Apache.
+  <IfModule mod_proxy.c>
+    <IfModule mod_proxy_http.c>
+      RewriteRule ^history-api/(.*)$ http://127.0.0.1:8090/$1 [P,L]
+      RewriteRule ^history-api$ http://127.0.0.1:8090/ [P,L]
+    </IfModule>
+  </IfModule>
+
+  # Return quickly for CORS preflight requests.
+  RewriteCond %{REQUEST_METHOD} OPTIONS
+  RewriteRule ^(.*)$ $1 [R=204,L]
+
+  # SPA fallback for React Router.
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "SAMEORIGIN"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+
+  # Deployment script replaces __APP_DOMAIN_REGEX__.
+  # Example after replacement:
+  #   __APP_DOMAIN_REGEX__ = example.com
+  # This allows:
+  #   https://example.com
+  #   https://sub.example.com
+  #   https://example.com:443
+  SetEnvIf Origin "^https?://([A-Za-z0-9-]+\\.)?__APP_DOMAIN_REGEX__(:[0-9]+)?$" ALLOW_ORIGIN=$0
+
+  Header always set Access-Control-Allow-Origin "%{ALLOW_ORIGIN}e" env=ALLOW_ORIGIN
+  Header always set Access-Control-Allow-Credentials "true" env=ALLOW_ORIGIN
+  Header always set Access-Control-Allow-Headers "Origin, X-Requested-With, Content-Type, Accept, Authorization" env=ALLOW_ORIGIN
+  Header always set Access-Control-Allow-Methods "GET, POST, OPTIONS" env=ALLOW_ORIGIN
+  Header always set Vary "Origin"
+</IfModule>

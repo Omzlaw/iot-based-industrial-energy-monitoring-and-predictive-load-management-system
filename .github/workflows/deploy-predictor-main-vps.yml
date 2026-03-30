@@ -1,0 +1,102 @@
+name: Deploy Predictor Main to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "MSc Project/PythonPredictor/main.py"
+      - "MSc Project/PythonPredictor/requirements.main.txt"
+      - "MSc Project/scripts/deploy/predictor_vps_deploy.sh"
+      - ".github/workflows/deploy-predictor-main-vps.yml"
+
+jobs:
+  deploy-predictor-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package predictor sources
+        run: |
+          set -euo pipefail
+          SRC_DIR="MSc Project/PythonPredictor"
+          PKG_DIR="$(mktemp -d)"
+          cp "${SRC_DIR}/main.py" "${PKG_DIR}/"
+          cp "${SRC_DIR}/requirements.main.txt" "${PKG_DIR}/"
+          tar -C "${PKG_DIR}" -czf predictor-main-src.tgz .
+          rm -rf "${PKG_DIR}"
+
+      - name: Setup SSH
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "Missing required secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          ssh-keyscan -p "${PORT}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload release and deploy script
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          scp -P "${PORT}" predictor-main-src.tgz "MSc Project/scripts/deploy/predictor_vps_deploy.sh" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/"
+
+      - name: Deploy on VPS
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          if [ -z "${{ secrets.PREDICTOR_MAIN_SERVICE }}" ] || [ -z "${{ secrets.PREDICTOR_MAIN_APP_DIR }}" ]; then
+            echo "Missing required secrets: PREDICTOR_MAIN_SERVICE, PREDICTOR_MAIN_APP_DIR" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.PREDICTOR_MAIN_ENV }}" ]; then
+            echo "Missing required secret: PREDICTOR_MAIN_ENV" >&2
+            exit 1
+          fi
+          tmp_env="$(mktemp)"
+          printf '%s' "${{ secrets.PREDICTOR_MAIN_ENV }}" > "${tmp_env}"
+          if ! grep -q '^HIVEMQ_USER=' "${tmp_env}"; then
+            echo "PREDICTOR_MAIN_ENV must include HIVEMQ_USER" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          if ! grep -q '^HIVEMQ_PASS=' "${tmp_env}"; then
+            echo "PREDICTOR_MAIN_ENV must include HIVEMQ_PASS" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          if ! grep -q '^MQTT_BROKER_HOST=' "${tmp_env}"; then
+            echo "PREDICTOR_MAIN_ENV must include MQTT_BROKER_HOST" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          if ! grep -q '^MQTT_BROKER_PORT=' "${tmp_env}"; then
+            echo "PREDICTOR_MAIN_ENV must include MQTT_BROKER_PORT" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          if ! grep -q '^PLANT_IDENTIFIER=' "${tmp_env}"; then
+            echo "PREDICTOR_MAIN_ENV must include PLANT_IDENTIFIER" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          ENV_B64="$(base64 -w 0 < "${tmp_env}")"
+          rm -f "${tmp_env}"
+          ssh -p "${PORT}" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "\
+            RELEASE_ARCHIVE=/tmp/predictor-main-src.tgz \
+            SERVICE_NAME='${{ secrets.PREDICTOR_MAIN_SERVICE }}' \
+            ENTRYPOINT=main.py \
+            APP_DIR='${{ secrets.PREDICTOR_MAIN_APP_DIR }}' \
+            ENV_B64='${ENV_B64}' \
+            KEEP_RELEASES='${{ secrets.PREDICTOR_KEEP_RELEASES }}' \
+            bash /tmp/predictor_vps_deploy.sh"

@@ -1,0 +1,21 @@
+0 verbose cli /usr/local/bin/node /usr/local/bin/npm
+1 info using npm@10.9.2
+2 info using node@v16.8.0
+3 warn cli npm v10.9.2 does not support Node.js v16.8.0. This version of npm supports the following node versions: `^18.17.0 || >=20.5.0`. You can find the latest version at https://nodejs.org/.
+4 silly config load:file:/usr/local/lib/node_modules/npm/npmrc
+5 silly config load:file:/Users/omzlaw/GCU Masters/MSc Project/DashboardReact/.npmrc
+6 silly config load:file:/Users/omzlaw/.npmrc
+7 silly config load:file:/usr/local/etc/npmrc
+8 verbose title npm run build
+9 verbose argv "run" "build"
+10 verbose logfile logs-max:10 dir:/Users/omzlaw/GCU Masters/MSc Project/DashboardReact/.npm-cache/_logs/2026-02-24T01_36_28_198Z-
+11 verbose logfile /Users/omzlaw/GCU Masters/MSc Project/DashboardReact/.npm-cache/_logs/2026-02-24T01_36_28_198Z-debug-0.log
+12 silly logfile done cleaning log files
+13 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with ENOTFOUND
+14 verbose cwd /Users/omzlaw/GCU Masters/MSc Project/DashboardReact
+15 verbose os Darwin 22.6.0
+16 verbose node v16.8.0
+17 verbose npm  v10.9.2
+18 verbose exit 1
+19 verbose code 1
+20 error A complete log of this run can be found in: /Users/omzlaw/GCU Masters/MSc Project/DashboardReact/.npm-cache/_logs/2026-02-24T01_36_28_198Z-debug-0.log

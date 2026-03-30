@@ -1,0 +1,89 @@
+name: Deploy History API to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "MSc Project/PythonPredictor/history_api.py"
+      - "MSc Project/PythonPredictor/export_chapter4_data.py"
+      - "MSc Project/PythonPredictor/requirements.history_api.txt"
+      - "MSc Project/scripts/deploy/predictor_vps_deploy.sh"
+      - ".github/workflows/deploy-history-api-vps.yml"
+
+jobs:
+  deploy-history-api:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package history API sources
+        run: |
+          set -euo pipefail
+          SRC_DIR="MSc Project/PythonPredictor"
+          PKG_DIR="$(mktemp -d)"
+          cp "${SRC_DIR}/history_api.py" "${PKG_DIR}/"
+          cp "${SRC_DIR}/export_chapter4_data.py" "${PKG_DIR}/"
+          cp "${SRC_DIR}/requirements.history_api.txt" "${PKG_DIR}/"
+          tar -C "${PKG_DIR}" -czf history-api-src.tgz .
+          rm -rf "${PKG_DIR}"
+
+      - name: Setup SSH
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "Missing required secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          ssh-keyscan -p "${PORT}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload release and deploy script
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          scp -P "${PORT}" history-api-src.tgz "MSc Project/scripts/deploy/predictor_vps_deploy.sh" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/"
+
+      - name: Deploy on VPS
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          if [ -z "${{ secrets.HISTORY_API_SERVICE }}" ] || [ -z "${{ secrets.HISTORY_API_APP_DIR }}" ]; then
+            echo "Missing required secrets: HISTORY_API_SERVICE, HISTORY_API_APP_DIR" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.HISTORY_API_ENV }}" ]; then
+            echo "Missing required secret: HISTORY_API_ENV" >&2
+            exit 1
+          fi
+          tmp_env="$(mktemp)"
+          printf '%s' "${{ secrets.HISTORY_API_ENV }}" > "${tmp_env}"
+          if ! grep -q '^PLANT_IDENTIFIER=' "${tmp_env}"; then
+            echo "HISTORY_API_ENV must include PLANT_IDENTIFIER" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          if ! grep -q '^LOGGER_OUTPUT_DIR=' "${tmp_env}"; then
+            echo "HISTORY_API_ENV must include LOGGER_OUTPUT_DIR" >&2
+            rm -f "${tmp_env}"
+            exit 1
+          fi
+          ENV_B64="$(base64 -w 0 < "${tmp_env}")"
+          rm -f "${tmp_env}"
+          ssh -p "${PORT}" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "\
+            RELEASE_ARCHIVE=/tmp/history-api-src.tgz \
+            SERVICE_NAME='${{ secrets.HISTORY_API_SERVICE }}' \
+            ENTRYPOINT=history_api.py \
+            APP_DIR='${{ secrets.HISTORY_API_APP_DIR }}' \
+            ENV_B64='${ENV_B64}' \
+            KEEP_RELEASES='${{ secrets.PREDICTOR_KEEP_RELEASES }}' \
+            bash /tmp/predictor_vps_deploy.sh"

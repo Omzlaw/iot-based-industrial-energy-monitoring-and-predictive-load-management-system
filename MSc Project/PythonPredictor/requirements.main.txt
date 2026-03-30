@@ -1,0 +1,4 @@
+certifi>=2024.8.30
+numpy>=1.26,<2.2
+paho-mqtt>=2.1.0
+python-dotenv>=1.0.1

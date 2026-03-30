@@ -1,0 +1,90 @@
+name: Deploy React Dashboard to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "MSc Project/DashboardReact/**"
+      - "MSc Project/scripts/deploy/react_vps_deploy.sh"
+      - ".github/workflows/deploy-react-vps.yml"
+
+jobs:
+  deploy-react:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: "MSc Project/DashboardReact/package-lock.json"
+
+      - name: Build React app
+        run: |
+          set -euo pipefail
+          cd "MSc Project/DashboardReact"
+          if [ -z "${{ secrets.REACT_ENV_FILE }}" ]; then
+            echo "Missing required secret: REACT_ENV_FILE" >&2
+            exit 1
+          fi
+          printf '%s' "${{ secrets.REACT_ENV_FILE }}" > .env.production
+          if ! grep -q '^VITE_BASE_PATH=' .env.production; then
+            echo "REACT_ENV_FILE must include VITE_BASE_PATH (use / for root or /frontend/ for subpath)" >&2
+            exit 1
+          fi
+          if ! grep -q '^VITE_MQTT_URL=' .env.production; then
+            echo "REACT_ENV_FILE must include VITE_MQTT_URL" >&2
+            exit 1
+          fi
+          if ! grep -q '^VITE_MQTT_USERNAME=' .env.production; then
+            echo "REACT_ENV_FILE must include VITE_MQTT_USERNAME" >&2
+            exit 1
+          fi
+          if ! grep -q '^VITE_MQTT_PASSWORD=' .env.production; then
+            echo "REACT_ENV_FILE must include VITE_MQTT_PASSWORD" >&2
+            exit 1
+          fi
+          npm ci
+          npm run build
+          tar -C dist -czf "${GITHUB_WORKSPACE}/react-dist.tgz" .
+
+      - name: Setup SSH
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "Missing required secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          ssh-keyscan -p "${PORT}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload release and deploy script
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          scp -P "${PORT}" "${GITHUB_WORKSPACE}/react-dist.tgz" "MSc Project/scripts/deploy/react_vps_deploy.sh" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/"
+
+      - name: Deploy on VPS
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.VPS_PORT }}"
+          [ -z "${PORT}" ] && PORT="22"
+          ssh -p "${PORT}" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "\
+            RELEASE_ARCHIVE=/tmp/react-dist.tgz \
+            TARGET_DIR='${{ secrets.REACT_TARGET_DIR }}' \
+            WEB_USER='${{ secrets.REACT_WEB_USER }}' \
+            WEB_GROUP='${{ secrets.REACT_WEB_GROUP }}' \
+            APACHE_SERVICE='${{ secrets.REACT_APACHE_SERVICE }}' \
+            APP_DOMAIN='${{ secrets.REACT_APP_DOMAIN }}' \
+            bash /tmp/react_vps_deploy.sh"
