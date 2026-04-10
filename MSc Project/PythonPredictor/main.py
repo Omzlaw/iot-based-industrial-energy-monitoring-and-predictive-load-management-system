@@ -6,6 +6,7 @@ import time
 import numpy as np
 import paho.mqtt.client as mqtt
 from collections import deque
+from datetime import datetime, timezone
 
 try:
   from dotenv import load_dotenv
@@ -155,7 +156,22 @@ def _parse_telemetry_payload(data: dict):
   if "total_power_w" not in system or "timestamp" not in system:
     return None
   total_power_w = float(system["total_power_w"])
-  sample_ts = float(system["timestamp"])
+  sample_ts_raw = system.get("timestamp", data.get("timestamp"))
+  try:
+    sample_ts = float(sample_ts_raw)
+  except Exception:
+    text = str(sample_ts_raw or "").strip()
+    if not text:
+      return None
+    if text.endswith("Z"):
+      text = text[:-1] + "+00:00"
+    try:
+      dt = datetime.fromisoformat(text)
+      if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+      sample_ts = dt.timestamp()
+    except Exception:
+      return None
   current_total_energy_wh = float(energy.get("total_energy_wh", 0.0) or 0.0)
   budget = energy.get("budget", {}) or {}
   current_energy_goal_wh = float(
@@ -201,8 +217,13 @@ def _smoothed_power() -> float:
   return ema_power_w
 
 def _forecast_power(horizon_sec: float) -> float:
-  # Short-term plant demand cannot be negative; clamp the linear extrapolation.
-  return max(0.0, forecast_trend(list(time_buffer), list(power_ema_buffer), horizon_sec))
+  baseline_power_w = float(power_ema_buffer[-1]) if len(power_ema_buffer) else 0.0
+  raw_forecast_w = forecast_trend(list(time_buffer), list(power_ema_buffer), horizon_sec)
+  # For low-power benches, linear extrapolation can swing negative and collapse the
+  # short-horizon forecast to zero even while the recent EMA is clearly non-zero.
+  if raw_forecast_w <= 0.0 and baseline_power_w > 0.0:
+    return baseline_power_w
+  return max(0.0, raw_forecast_w)
 
 def _compute_energy_projection(
   predicted_power_w: float,
@@ -213,34 +234,52 @@ def _compute_energy_projection(
 ) -> dict:
   predicted_incremental_energy_wh = max(0.0, predicted_power_w) * (horizon_sec / 3600.0)
   predicted_total_energy_wh = current_total_energy_wh + predicted_incremental_energy_wh
-  projected_energy_goal_wh = current_energy_goal_wh + predicted_incremental_energy_wh
+  predicted_window_energy_wh = predicted_incremental_energy_wh
+  projected_energy_goal_wh = predicted_window_energy_wh
+  current_energy_goal_ratio = (current_energy_goal_wh / energy_cap_goal_wh) if energy_cap_goal_wh > 0.0 else 0.0
+  projected_energy_goal_ratio = (projected_energy_goal_wh / energy_cap_goal_wh) if energy_cap_goal_wh > 0.0 else 0.0
+  energy_window_pressure = (energy_cap_goal_wh > 0.0) and (current_energy_goal_wh >= energy_cap_goal_wh * RISK_MARGIN_RATIO)
   energy_budget_risk = (energy_cap_goal_wh > 0.0) and (projected_energy_goal_wh >= energy_cap_goal_wh * RISK_MARGIN_RATIO)
   return {
     "predicted_incremental_energy_wh": predicted_incremental_energy_wh,
+    "predicted_window_energy_wh": predicted_window_energy_wh,
     "predicted_total_energy_wh": predicted_total_energy_wh,
     "projected_energy_goal_wh": projected_energy_goal_wh,
+    "current_energy_goal_ratio": current_energy_goal_ratio,
+    "projected_energy_goal_ratio": projected_energy_goal_ratio,
+    "energy_window_pressure": energy_window_pressure,
     "energy_budget_risk": energy_budget_risk,
   }
 
 def _determine_risk_levels(
   predicted_power_w: float,
   ema_power_value: float,
+  energy_window_pressure: bool,
   energy_budget_risk: bool,
   energy_cap_goal_wh: float,
+  current_energy_goal_wh: float,
   projected_energy_goal_wh: float,
   max_total_power_w: float,
 ) -> dict:
   power_limit_w = max(0.0, float(max_total_power_w or 0.0))
-  peak_risk = (predicted_power_w > (power_limit_w * RISK_MARGIN_RATIO)) or (ema_power_value > power_limit_w) or energy_budget_risk
-  if energy_cap_goal_wh > 0.0 and projected_energy_goal_wh > energy_cap_goal_wh * 1.01:
+  power_peak_risk = (predicted_power_w > (power_limit_w * RISK_MARGIN_RATIO)) or (ema_power_value > power_limit_w)
+  peak_risk = power_peak_risk or energy_window_pressure or energy_budget_risk
+  if energy_cap_goal_wh > 0.0 and (
+    projected_energy_goal_wh > energy_cap_goal_wh * 1.01 or current_energy_goal_wh > energy_cap_goal_wh * 1.01
+  ):
     risk_level = "HIGH"
   elif predicted_power_w > power_limit_w * 1.05:
     risk_level = "HIGH"
-  elif predicted_power_w > power_limit_w * RISK_MARGIN_RATIO or energy_budget_risk:
+  elif predicted_power_w > power_limit_w * RISK_MARGIN_RATIO or energy_window_pressure or energy_budget_risk:
     risk_level = "MEDIUM"
   else:
     risk_level = "LOW"
-  return {"peak_risk": peak_risk, "risk_level": risk_level}
+  return {
+    "peak_risk": peak_risk,
+    "power_peak_risk": power_peak_risk,
+    "energy_window_pressure": energy_window_pressure,
+    "risk_level": risk_level,
+  }
 
 def _resolve_process_protection(process: dict, base_reason: str) -> tuple[str, set]:
   reason_hint = base_reason
@@ -364,6 +403,7 @@ def _build_prediction_payload(
     "predicted_energy_wh": round(energy_projection["predicted_incremental_energy_wh"], 4),
     "predicted_incremental_energy_wh": round(energy_projection["predicted_incremental_energy_wh"], 4),
     "predicted_total_energy_wh": round(energy_projection["predicted_total_energy_wh"], 4),
+    "predicted_window_energy_wh": round(energy_projection["predicted_window_energy_wh"], 4),
     "horizon_sec": horizon_sec,
     "MAX_TOTAL_POWER_W": max_total_power_w,
     "MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH": energy_cap_goal_wh,
@@ -373,10 +413,15 @@ def _build_prediction_payload(
     "risk_level": risk_level,
     "peak_risk": bool(peak_risk),
     "energy_budget_risk": bool(energy_budget_risk),
+    "energy_window_pressure": bool(energy_projection["energy_window_pressure"]),
     "current_energy_1d_wh": round(current_energy_goal_wh, 4),
     "projected_energy_1d_wh": round(energy_projection["projected_energy_goal_wh"], 4),
+    "current_energy_window_wh": round(current_energy_goal_wh, 4),
+    "projected_energy_window_wh": round(energy_projection["projected_energy_goal_wh"], 4),
     "current_energy_goal_wh": round(current_energy_goal_wh, 4),
     "projected_energy_goal_wh": round(energy_projection["projected_energy_goal_wh"], 4),
+    "current_energy_goal_ratio": round(energy_projection["current_energy_goal_ratio"], 6),
+    "projected_energy_goal_ratio": round(energy_projection["projected_energy_goal_ratio"], 6),
     "sample_count": len(power_ema_buffer),
     "warming_up": len(power_ema_buffer) < 10,
     "env_temp_c": round(env_temp, 2),
@@ -630,12 +675,19 @@ def on_message(client, userdata, msg):
   risk = _determine_risk_levels(
     predicted_power_w,
     ema_power_value,
+    projected["energy_window_pressure"],
     projected["energy_budget_risk"],
     energy_cap_goal_wh,
+    current_energy_goal_wh,
     projected["projected_energy_goal_wh"],
     max_total_power_w,
   )
-  reason_hint = "ENERGY_BUDGET" if projected["energy_budget_risk"] else "NONE"
+  if projected["energy_budget_risk"] or projected["energy_window_pressure"]:
+    reason_hint = "ENERGY_GOAL_WINDOW"
+  elif risk["power_peak_risk"]:
+    reason_hint = "PEAK_RISK"
+  else:
+    reason_hint = "NONE"
   reason_hint, protected_devices = _resolve_process_protection(process, reason_hint)
   production_pressure = _compute_production_pressure(process)
 

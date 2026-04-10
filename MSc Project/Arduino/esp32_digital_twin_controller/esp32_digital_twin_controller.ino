@@ -202,6 +202,13 @@ int energyBucketCount = 0;
 float currentMinuteBucketWh = 0.0f;
 unsigned long currentMinuteBucketStartMs = 0;
 float cumulativeEnergyWh = 0.0f;
+float currentGoalWindowWh = 0.0f;
+unsigned long energyGoalWindowStartMs = 0;
+unsigned long energyGoalWindowResetCount = 0;
+float energyGoalWindowConfigWh = -1.0f;
+float energyGoalWindowConfigDurationSec = -1.0f;
+float energyGoalWindowConfigPowerCapW = -1.0f;
+char energyGoalWindowResetReason[32] = "startup";
 
 // -----------------------------
 // Sensor conversion constants
@@ -445,7 +452,7 @@ bool processLockActive = false;
 ProductionState productionState = PROCESS_IDLE;
 unsigned long processStartMs = 0;
 uint32_t processCycleCount = 0;
-String predictorMode = "OFFLINE";
+String predictorMode = "ONLINE";
 bool predictorModeSet = true;
 bool processConfigGoalCyclesSet = false;
 bool processConfigTank1LevelSet = false;
@@ -642,6 +649,7 @@ struct LoadChannel {
   float powerW = 0.0f;
   float voltageV = 0.0f;
   float tempC = NAN; // used by motors
+  float goalWindowEnergyWh = 0.0f;
   String health = "OK";
   String faultCode = "NONE";
 
@@ -727,6 +735,14 @@ struct LoadChannel {
 
   void applyHardware(unsigned long nowMs) {
     const bool effectiveOn = on && !faultActive;
+    if (!hasPwm) {
+      duty = effectiveOn ? 1.0f : 0.0f;
+      appliedDuty = duty;
+      lastDutyUpdateMs = nowMs;
+      writeRelayState(pins.relayPin, effectiveOn);
+      return;
+    }
+
     float effectiveDuty = constrain(duty, 0.0f, 1.0f);
     if (smoothDuty) {
       effectiveDuty = resolveAppliedDuty(nowMs);
@@ -740,15 +756,7 @@ struct LoadChannel {
         lastDutyUpdateMs = nowMs;
       }
     }
-    // For relay-only channels, emulate duty by time-slicing relay on/off.
-    bool relayShouldBeOn = effectiveOn;
-    if (!hasPwm && effectiveOn) {
-      const unsigned long periodMs = 5000;
-      const unsigned long onWindowMs = (unsigned long)(periodMs * constrain(effectiveDuty, 0.0f, 1.0f));
-      relayShouldBeOn = ((nowMs % periodMs) < onWindowMs);
-    }
-
-    writeRelayState(pins.relayPin, relayShouldBeOn);
+    writeRelayState(pins.relayPin, effectiveOn);
 
     if (hasPwm && pins.pwmPin >= 0) {
       uint8_t pwm = effectiveOn ? (uint8_t)(constrain(effectiveDuty, 0.0f, 1.0f) * 255.0f) : 0;
@@ -1595,11 +1603,11 @@ void applyProductionProcess(float dtSec) {
   // Fallback thermal model only when a DS18B20 sensor is missing for that tank.
   if (SIMULATE_TANK_TEMPS_WHEN_SENSOR_MISSING) {
     if (!tankTempSensor1Found) {
-      if (heater1.on) tank1TempC += TANK_HEAT_RATE_C_PER_SEC * max(0.0f, heater1.duty) * dtSec;
+      if (heater1.on) tank1TempC += TANK_HEAT_RATE_C_PER_SEC * dtSec;
       tank1TempC += (ambientTempC - tank1TempC) * TANK_COOL_RATE_PER_SEC * dtSec;
     }
     if (!tankTempSensor2Found) {
-      if (heater2.on) tank2TempC += TANK_HEAT_RATE_C_PER_SEC * max(0.0f, heater2.duty) * dtSec;
+      if (heater2.on) tank2TempC += TANK_HEAT_RATE_C_PER_SEC * dtSec;
       tank2TempC += (ambientTempC - tank2TempC) * TANK_COOL_RATE_PER_SEC * dtSec;
     }
   }
@@ -1997,11 +2005,15 @@ LoadClass parseLoadClass(const String& s) {
 
 void rememberDutyBeforeOff(LoadChannel* ld) {
   if (ld == nullptr) return;
-  ld->lastDuty = clampf(ld->duty, 0.0f, 1.0f);
+  ld->lastDuty = ld->hasPwm ? clampf(ld->duty, 0.0f, 1.0f) : (ld->on ? 1.0f : 0.0f);
 }
 
 void restoreDutyOn(LoadChannel* ld) {
   if (ld == nullptr) return;
+  if (!ld->hasPwm) {
+    ld->duty = (ld->lastDuty > 0.0f) ? 1.0f : 0.0f;
+    return;
+  }
   float minDuty = (ld->loadClass == CLASS_CRITICAL) ? CRITICAL_MIN_DEVICE_DUTY : MIN_DEVICE_DUTY;
   float restored = clampf(ld->lastDuty, 0.0f, 1.0f);
   if (restored < minDuty) restored = minDuty;
@@ -2023,13 +2035,53 @@ static bool isProcessLoad(const LoadChannel* ld) {
   return ld == &motor1 || ld == &motor2 || ld == &heater1 || ld == &heater2;
 }
 
+static bool loadSupportsDutyControl(const LoadChannel* ld) {
+  return ld != nullptr && ld->hasPwm;
+}
+
+static float sanitizeDutyForLoad(const LoadChannel* ld, float duty) {
+  const float clipped = clampf(duty, 0.0f, 1.0f);
+  if (!loadSupportsDutyControl(ld)) {
+    return (clipped > 0.0f) ? 1.0f : 0.0f;
+  }
+  return clipped;
+}
+
+static bool heaterBlockedByAmbient(const LoadChannel* ld) {
+  if (ld == nullptr) return false;
+  if (productionProcessEnabled) return false;
+  if (ld != &heater1 && ld != &heater2) return false;
+  if (isnan(ambientTempC)) return false;
+  return ambientTempC >= HEATER_WARM_TEMP_C;
+}
+
+static bool isHybridPolicy() {
+  return controlPolicy == POLICY_HYBRID;
+}
+
+static bool isAiPreferredPolicy() {
+  return controlPolicy == POLICY_AI_PREFERRED;
+}
+
 static bool isAiDrivenPolicy() {
-  return controlPolicy == POLICY_AI_PREFERRED || controlPolicy == POLICY_HYBRID;
+  return isAiPreferredPolicy() || isHybridPolicy();
+}
+
+static bool isEnergyGoalWindowAtRisk(float ratio = 0.95f) {
+  return (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f)
+      && (getCurrentEnergyGoalWindowWh() >= (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH * ratio));
+}
+
+static bool shouldApplyAiProcessOverrides() {
+  if (isAiPreferredPolicy()) return true;
+  if (!isHybridPolicy()) return false;
+  return predictorPeakRisk || isEnergyGoalWindowAtRisk(0.95f);
 }
 
 void applyAiProcessOverridesFromSuggestions() {
   if (!productionProcessEnabled) return;
   if (!isAiDrivenPolicy()) return;
+  if (!shouldApplyAiProcessOverrides()) return;
   PredictionInputSource selectedSrc = PRED_SRC_LONG_RF;
   String reason;
   const PredictionChannelState* selectedState = selectDynamicProcessPredictionState(&selectedSrc, &reason);
@@ -2069,7 +2121,7 @@ void applyAiProcessOverridesFromSuggestions() {
       }
     }
     if (s.hasDuty) {
-      float d = clampf(s.dutyValue, 0.0f, 1.0f);
+      float d = sanitizeDutyForLoad(ld, s.dutyValue);
       ld->duty = d;
       if (d > 0.0f) ld->lastDuty = d;
       if (d <= 0.0f) ld->on = false;
@@ -2098,8 +2150,13 @@ bool applySingleAiSuggestion(const AISuggestion& s) {
   const float oldDuty = ld->duty;
   if (s.hasOn) ld->on = s.onValue;
   if (s.hasDuty) {
-    float dutyFloor = (ld->loadClass == CLASS_CRITICAL) ? CRITICAL_MIN_DEVICE_DUTY : MIN_DEVICE_DUTY;
-    ld->duty = clampf(max(dutyFloor, s.dutyValue), 0.0f, 1.0f);
+    if (loadSupportsDutyControl(ld)) {
+      float dutyFloor = (ld->loadClass == CLASS_CRITICAL) ? CRITICAL_MIN_DEVICE_DUTY : MIN_DEVICE_DUTY;
+      ld->duty = clampf(max(dutyFloor, s.dutyValue), 0.0f, 1.0f);
+    } else {
+      ld->duty = sanitizeDutyForLoad(ld, s.dutyValue);
+      ld->on = ld->duty > 0.0f;
+    }
   } else if (s.hasOn && s.onValue && !wasOn) {
     restoreDutyOn(ld);
   } else if (s.hasOn && !s.onValue && wasOn) {
@@ -2121,6 +2178,18 @@ bool applyCachedAiSuggestion() {
   return false;
 }
 
+int applyCachedAiSuggestions(uint8_t maxToApply) {
+  int appliedCount = 0;
+  const uint8_t targetCount = (maxToApply > 0) ? maxToApply : 1;
+  for (int i = 0; i < aiSuggestionCount; ++i) {
+    if (applySingleAiSuggestion(aiSuggestions[i])) {
+      appliedCount++;
+      if (appliedCount >= targetCount) break;
+    }
+  }
+  return appliedCount;
+}
+
 String isoTimestampUtc() {
   time_t now = time(nullptr);
   if (now < 100000) {
@@ -2133,6 +2202,76 @@ String isoTimestampUtc() {
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
   return String(buf);
+}
+
+String isoTimestampUtcForEpoch(time_t epochSec) {
+  if (epochSec < 100000) {
+    return String("UNSYNCED_") + String((unsigned long)max(0L, (long)epochSec));
+  }
+  struct tm tmUtc;
+  gmtime_r(&epochSec, &tmUtc);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+  return String(buf);
+}
+
+void setEnergyGoalWindowResetReason(const char* reason) {
+  snprintf(energyGoalWindowResetReason, sizeof(energyGoalWindowResetReason), "%s", (reason && reason[0]) ? reason : "unspecified");
+}
+
+void syncEnergyGoalWindowConfigSnapshot() {
+  energyGoalWindowConfigWh = MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH;
+  energyGoalWindowConfigDurationSec = ENERGY_GOAL_DURATION_SEC;
+  energyGoalWindowConfigPowerCapW = MAX_TOTAL_POWER_W;
+}
+
+void resetEnergyGoalWindowState(const char* reason, unsigned long startMs, bool incrementCounter) {
+  if (incrementCounter) {
+    energyGoalWindowResetCount++;
+  }
+  energyGoalWindowStartMs = startMs;
+  currentGoalWindowWh = 0.0f;
+  for (size_t i = 0; i < LOAD_COUNT; ++i) {
+    loads[i]->goalWindowEnergyWh = 0.0f;
+  }
+  setEnergyGoalWindowResetReason(reason);
+  syncEnergyGoalWindowConfigSnapshot();
+}
+
+unsigned long energyGoalWindowDurationMs() {
+  return (unsigned long)max(60000.0f, ENERGY_GOAL_DURATION_SEC * 1000.0f);
+}
+
+void advanceEnergyGoalWindowToMs(unsigned long targetMs, const char* reason) {
+  if (energyGoalWindowStartMs == 0) {
+    resetEnergyGoalWindowState(reason, targetMs, false);
+    return;
+  }
+  if (targetMs <= energyGoalWindowStartMs) {
+    return;
+  }
+  const unsigned long durationMs = energyGoalWindowDurationMs();
+  while ((targetMs - energyGoalWindowStartMs) >= durationMs) {
+    energyGoalWindowStartMs += durationMs;
+    currentGoalWindowWh = 0.0f;
+    setEnergyGoalWindowResetReason(reason);
+    syncEnergyGoalWindowConfigSnapshot();
+    energyGoalWindowResetCount++;
+  }
+}
+
+void ensureEnergyGoalWindowConfigured(unsigned long nowMs) {
+  if (energyGoalWindowStartMs == 0) {
+    resetEnergyGoalWindowState("startup", nowMs, false);
+    return;
+  }
+  const bool configChanged =
+    fabsf(energyGoalWindowConfigWh - MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH) > 0.001f
+    || fabsf(energyGoalWindowConfigDurationSec - ENERGY_GOAL_DURATION_SEC) > 0.001f
+    || fabsf(energyGoalWindowConfigPowerCapW - MAX_TOTAL_POWER_W) > 0.001f;
+  if (configChanged) {
+    resetEnergyGoalWindowState("config_changed", nowMs, true);
+  }
 }
 
 float readVoltageSensorV(uint8_t pin, float ratio) {
@@ -2411,15 +2550,20 @@ void applySceneAutomation() {
 }
 
 void updateEnergyWindows(float totalPowerW, float elapsedSec) {
+  const unsigned long nowMs = millis();
   float stepWh = (totalPowerW * max(0.0f, elapsedSec)) / 3600.0f;
+  float stepWhByLoad[LOAD_COUNT];
+  for (size_t i = 0; i < LOAD_COUNT; ++i) {
+    stepWhByLoad[i] = (loads[i]->powerW * max(0.0f, elapsedSec)) / 3600.0f;
+  }
   cumulativeEnergyWh += stepWh;
   currentMinuteBucketWh += stepWh;
 
   if (currentMinuteBucketStartMs == 0) {
-    currentMinuteBucketStartMs = millis();
+    currentMinuteBucketStartMs = nowMs;
   }
 
-  while ((millis() - currentMinuteBucketStartMs) >= 60000UL) {
+  while ((nowMs - currentMinuteBucketStartMs) >= 60000UL) {
     energyMinuteBucketsWh[energyBucketHead] = currentMinuteBucketWh;
     energyBucketHead = (energyBucketHead + 1) % ENERGY_BUCKETS_PER_DAY;
     if (energyBucketCount < ENERGY_BUCKETS_PER_DAY) {
@@ -2427,6 +2571,36 @@ void updateEnergyWindows(float totalPowerW, float elapsedSec) {
     }
     currentMinuteBucketWh = 0.0f;
     currentMinuteBucketStartMs += 60000UL;
+  }
+
+  ensureEnergyGoalWindowConfigured(nowMs);
+  const unsigned long durationMs = energyGoalWindowDurationMs();
+  if (elapsedSec <= 0.0f) {
+    advanceEnergyGoalWindowToMs(nowMs, "window_completed");
+    return;
+  }
+
+  const double stepDurationMs = max(1.0, (double)elapsedSec * 1000.0);
+  const double stepEndMs = (double)nowMs;
+  const double stepStartMs = max(0.0, stepEndMs - stepDurationMs);
+  advanceEnergyGoalWindowToMs((unsigned long)stepStartMs, "window_completed");
+
+  double cursorMs = max(stepStartMs, (double)energyGoalWindowStartMs);
+  while (cursorMs < stepEndMs) {
+    const double windowEndMs = (double)energyGoalWindowStartMs + (double)durationMs;
+    const double overlapEndMs = min(stepEndMs, windowEndMs);
+    const double overlapMs = max(0.0, overlapEndMs - cursorMs);
+    if (overlapMs > 0.0) {
+      const float overlapRatio = (float)(overlapMs / stepDurationMs);
+      currentGoalWindowWh += stepWh * overlapRatio;
+      for (size_t i = 0; i < LOAD_COUNT; ++i) {
+        loads[i]->goalWindowEnergyWh += stepWhByLoad[i] * overlapRatio;
+      }
+    }
+    cursorMs = overlapEndMs;
+    if (cursorMs + 0.5 >= windowEndMs) {
+      advanceEnergyGoalWindowToMs((unsigned long)windowEndMs, "window_completed");
+    }
   }
 }
 
@@ -2443,6 +2617,10 @@ float getWindowEnergyWh(int windowMinutes) {
 float getWindowEnergyByDurationSec(float durationSec) {
   int minutes = (int)roundf(max(60.0f, durationSec) / 60.0f);
   return getWindowEnergyWh(minutes);
+}
+
+float getCurrentEnergyGoalWindowWh() {
+  return max(0.0f, currentGoalWindowWh);
 }
 
 // -----------------------------
@@ -2477,7 +2655,6 @@ void applyPlantModeProfile() {
   // Apply a mode profile across all loads (similar intent as simulator)
   float motorDutyCap = 1.0f;
   float lightDutyCap = 1.0f;
-  float heaterDutyCap = 1.0f;
   float motorLoadFactor = 1.0f;
 
   switch (plantMode) {
@@ -2487,12 +2664,10 @@ void applyPlantModeProfile() {
     case PLANT_LOW_PROD:
       motorLoadFactor = 0.80f;
       lightDutyCap = 0.70f;
-      heaterDutyCap = 0.80f;
       break;
     case PLANT_ENERGY_SAVING:
       motorLoadFactor = 0.90f;
       lightDutyCap = 0.60f;
-      heaterDutyCap = 0.80f;
       break;
     default:
       break;
@@ -2506,8 +2681,6 @@ void applyPlantModeProfile() {
   motor2.duty = min(motor2.duty, motorDutyCap);
   light1.duty = min(light1.duty, lightDutyCap);
   light2.duty = min(light2.duty, lightDutyCap);
-  heater1.duty = min(heater1.duty, heaterDutyCap);
-  heater2.duty = min(heater2.duty, heaterDutyCap);
 }
 
 // -----------------------------
@@ -2572,17 +2745,22 @@ static void noteAutomaticRestore(LoadChannel* ld, unsigned long nowMs) {
 
 static float loadMinDuty(const LoadChannel* ld) {
   if (ld == nullptr) return MIN_DEVICE_DUTY;
+  if (!loadSupportsDutyControl(ld)) return 1.0f;
   return (ld->loadClass == CLASS_CRITICAL) ? CRITICAL_MIN_DEVICE_DUTY : MIN_DEVICE_DUTY;
 }
 
 static float desiredRestoreDuty(const LoadChannel* ld) {
   if (ld == nullptr) return 0.0f;
+  if (!loadSupportsDutyControl(ld)) {
+    return (ld->lastDuty > 0.0f) ? 1.0f : 0.0f;
+  }
   return clampf(max(loadMinDuty(ld), ld->lastDuty), 0.0f, 1.0f);
 }
 
 static float nextRestoreDuty(const LoadChannel* ld) {
   if (ld == nullptr) return 0.0f;
   const float desired = desiredRestoreDuty(ld);
+  if (!loadSupportsDutyControl(ld)) return desired;
   if (!ld->on) {
     return loadMinDuty(ld);
   }
@@ -2596,6 +2774,7 @@ static bool loadNeedsRestore(const LoadChannel* ld, unsigned long nowMs) {
   if (ld->faultActive || ld->restorePending) return false;
   if (productionProcessEnabled && isProcessLoad(ld)) return false;
   if (nowMs < ld->restoreBlockedUntilMs) return false;
+  if (heaterBlockedByAmbient(ld)) return false;
   const float desired = desiredRestoreDuty(ld);
   if (!ld->on) return desired > 0.0f;
   return (desired - ld->duty) > 0.01f;
@@ -2625,11 +2804,18 @@ static LoadChannel* selectRestoreCandidate(unsigned long nowMs) {
 
 static float expectedPowerForDuty(const LoadChannel* ld, float targetDuty) {
   if (ld == nullptr) return 0.0f;
-  const float clippedDuty = clampf(targetDuty, 0.0f, 1.0f);
+  const float clippedDuty = sanitizeDutyForLoad(ld, targetDuty);
   const float currentPower = max(0.0f, ld->powerW);
-  const float currentDuty = max(0.01f, ld->duty);
+  const float currentDuty = loadSupportsDutyControl(ld) ? max(0.01f, ld->duty) : (ld->on ? 1.0f : 0.0f);
   const float lastPower = max(0.0f, ld->lastActivePowerW);
-  const float lastDuty = max(0.01f, ld->lastActiveDuty);
+  const float lastDuty = loadSupportsDutyControl(ld) ? max(0.01f, ld->lastActiveDuty) : 1.0f;
+
+  if (!loadSupportsDutyControl(ld)) {
+    if (clippedDuty <= 0.0f) return 0.0f;
+    if (lastPower > 0.0f) return lastPower;
+    if (ld->on && currentPower > 0.0f) return currentPower;
+    return 0.0f;
+  }
 
   if (lastPower > 0.0f) {
     return max(0.0f, lastPower * (clippedDuty / lastDuty));
@@ -2676,6 +2862,57 @@ static float estimateRestoreCurrentAForDuty(const LoadChannel* ld, float targetD
   return max(0.0f, expectedPower / max(0.1f, voltageV));
 }
 
+static bool applyRuleOverloadCurtailment(unsigned long nowMs) {
+  LoadChannel* target = selectCurtailCandidate(false, false);
+  if (target == nullptr) return false;
+  const float minDuty = loadMinDuty(target);
+  if (target->duty > minDuty) {
+    target->duty = max(minDuty, target->duty - DUTY_STEP_SIZE);
+    noteAutomaticCurtail(target, nowMs);
+    registerControlActionTyped("curtail");
+    return true;
+  }
+  if (target->loadClass != CLASS_CRITICAL) {
+    rememberDutyBeforeOff(target);
+    target->on = false;
+    target->duty = 0.0f;
+    noteAutomaticCurtail(target, nowMs);
+    registerControlActionTyped("shed");
+    return true;
+  }
+  return false;
+}
+
+static bool applyRuleOverloadCurtailmentToTarget(float measuredPowerW, float targetPowerW, unsigned long nowMs) {
+  if (measuredPowerW <= targetPowerW) return false;
+  return applyRuleOverloadCurtailment(nowMs);
+}
+
+static bool applyRuleRiskCurtailment(const String& effectiveRiskLevel, unsigned long nowMs) {
+  LoadChannel* target = selectCurtailCandidate(false, false);
+  if (target == nullptr) return false;
+  const float minDuty = loadMinDuty(target);
+  float dutyTarget = (effectiveRiskLevel == "HIGH" || effectiveRiskLevel == "MEDIUM") ? 0.35f : 0.50f;
+  dutyTarget = max(dutyTarget, minDuty);
+  if (loadSupportsDutyControl(target) && target->duty > dutyTarget) {
+    target->duty = dutyTarget;
+    noteAutomaticCurtail(target, nowMs);
+    registerControlActionTyped("curtail");
+    return true;
+  }
+  if (effectiveRiskLevel == "HIGH"
+      && target->loadClass != CLASS_CRITICAL
+      && (!loadSupportsDutyControl(target) || target->duty <= (minDuty + 0.01f))) {
+    rememberDutyBeforeOff(target);
+    target->on = false;
+    target->duty = 0.0f;
+    noteAutomaticCurtail(target, nowMs);
+    registerControlActionTyped("shed");
+    return true;
+  }
+  return false;
+}
+
 void applyAutomaticControl(float totalPowerW) {
   const unsigned long nowMs = millis();
   static unsigned long lastUvActionMs = 0;
@@ -2706,10 +2943,15 @@ void applyAutomaticControl(float totalPowerW) {
 
   if (controlPolicy == POLICY_NO_ENERGY_MANAGEMENT) return;
   if (!controlCooldownOk()) return;
-  float energyGoalWindowWh = getWindowEnergyByDurationSec(ENERGY_GOAL_DURATION_SEC);
-  bool energyBudgetRisk = (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f) && (energyGoalWindowWh >= MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH * 0.95f);
+  float energyGoalWindowWh = getCurrentEnergyGoalWindowWh();
+  float energyGoalRatio = (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f)
+    ? (energyGoalWindowWh / MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH)
+    : 0.0f;
+  bool energyBudgetRisk = isEnergyGoalWindowAtRisk(0.95f);
   bool effectivePeakRisk = predictorPeakRisk || energyBudgetRisk;
   String effectiveRiskLevel = predictorRiskLevel;
+  float hybridTargetPowerW = MAX_TOTAL_POWER_W * ((energyBudgetRisk || energyGoalRatio >= 0.98f) ? 0.96f : 1.0f);
+  float aiTargetPowerW = MAX_TOTAL_POWER_W * ((energyBudgetRisk || energyGoalRatio >= 1.0f) ? 0.88f : 0.94f);
   if (energyBudgetRisk && energyGoalWindowWh > MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH * 1.01f) {
     effectiveRiskLevel = "HIGH";
   } else if (energyBudgetRisk && effectiveRiskLevel == "LOW") {
@@ -2718,17 +2960,6 @@ void applyAutomaticControl(float totalPowerW) {
 
   // Ambient heater rules (skip when production process is active).
   if (!productionProcessEnabled) {
-    if (ambientTempC >= HEATER_WARM_TEMP_C) {
-      for (LoadChannel* heater : {&heater1, &heater2}) {
-        if (!isPolicyManagedLoad(heater)) continue;
-        if (heater->on && heater->duty > MIN_DEVICE_DUTY) {
-          heater->duty = max(MIN_DEVICE_DUTY, heater->duty - HEATER_DUTY_STEP_SIZE);
-          noteAutomaticCurtail(heater, nowMs);
-          registerControlActionTyped("curtail");
-          return;
-        }
-      }
-    }
     if (ambientTempC >= HEATER_HOT_OFF_TEMP_C) {
       for (LoadChannel* heater : {&heater1, &heater2}) {
         if (!isPolicyManagedLoad(heater)) continue;
@@ -2746,56 +2977,29 @@ void applyAutomaticControl(float totalPowerW) {
 
   // Overload rule
   if (totalPowerW > MAX_TOTAL_POWER_W) {
-    LoadChannel* target = selectCurtailCandidate(false, false);
-    if (target != nullptr) {
-      const float minDuty = loadMinDuty(target);
-      if (target->duty > minDuty) {
-        target->duty = max(minDuty, target->duty - DUTY_STEP_SIZE);
-        noteAutomaticCurtail(target, nowMs);
-        registerControlActionTyped("curtail");
-      } else if (target->loadClass != CLASS_CRITICAL) {
-        rememberDutyBeforeOff(target);
-        target->on = false;
-        target->duty = 0.0f;
-        noteAutomaticCurtail(target, nowMs);
-        registerControlActionTyped("shed");
-      }
-      return;
-    }
-  }
-
-  // AI-first mode: after safety/overload, try AI suggestions first.
-  if (controlPolicy == POLICY_AI_PREFERRED) {
-    if (applyCachedAiSuggestion()) return;
+    if (applyRuleOverloadCurtailment(nowMs)) return;
   }
 
   // Peak-risk rule (from predictor)
   if (effectivePeakRisk) {
-    // Hybrid mode: AI suggestions get first chance under peak-risk.
-    if (controlPolicy == POLICY_HYBRID) {
-      if (applyCachedAiSuggestion()) return;
+    if (isAiPreferredPolicy()) {
+      const uint8_t aiBurst = (effectiveRiskLevel == "HIGH" || energyGoalRatio >= 1.0f) ? 2 : 1;
+      if (applyCachedAiSuggestions(aiBurst) > 0) return;
+      if (applyRuleOverloadCurtailmentToTarget(totalPowerW, aiTargetPowerW, nowMs)) return;
+      if (effectiveRiskLevel == "HIGH" && applyRuleRiskCurtailment(effectiveRiskLevel, nowMs)) return;
+      return;
     }
-    // Rule-only mode skips AI suggestions completely.
-    LoadChannel* target = selectCurtailCandidate(false, false);
-    if (target != nullptr) {
-      const float minDuty = loadMinDuty(target);
-      float dutyTarget = (effectiveRiskLevel == "HIGH" || effectiveRiskLevel == "MEDIUM") ? 0.35f : 0.50f;
-      dutyTarget = max(dutyTarget, minDuty);
-      if (target->duty > dutyTarget) {
-        target->duty = dutyTarget;
-        noteAutomaticCurtail(target, nowMs);
-        registerControlActionTyped("curtail");
-        return;
+    if (isHybridPolicy()) {
+      if ((energyBudgetRisk || energyGoalRatio >= 0.95f || effectiveRiskLevel == "MEDIUM" || effectiveRiskLevel == "HIGH")
+          && applyCachedAiSuggestion()) return;
+      if (predictorPeakRisk || totalPowerW > hybridTargetPowerW || effectiveRiskLevel == "HIGH") {
+        if (applyRuleRiskCurtailment(effectiveRiskLevel, nowMs)) return;
       }
-      if (effectiveRiskLevel == "HIGH" && target->loadClass != CLASS_CRITICAL && target->duty <= MIN_DEVICE_DUTY) {
-        rememberDutyBeforeOff(target);
-        target->on = false;
-        target->duty = 0.0f;
-        noteAutomaticCurtail(target, nowMs);
-        registerControlActionTyped("shed");
-        return;
-      }
+      if (applyRuleOverloadCurtailmentToTarget(totalPowerW, hybridTargetPowerW, nowMs)) return;
+      return;
     }
+    if (applyRuleRiskCurtailment(effectiveRiskLevel, nowMs)) return;
+    return;
   }
 
   // Restore rule
@@ -3109,10 +3313,11 @@ void handleDeviceSet(const String& devName, JsonObject setObj) {
   if (setObj.containsKey("duty")) {
     ld->controlReduced = false;
     ld->restoreBlockedUntilMs = 0;
-    ld->duty = clampf(setObj["duty"].as<float>(), 0.0f, 1.0f);
+    ld->duty = sanitizeDutyForLoad(ld, setObj["duty"].as<float>());
     if (ld->duty > 0.0f) {
       ld->lastDuty = ld->duty;
     }
+    ld->on = ld->duty > 0.0f;
   }
   if (setObj.containsKey("load_factor")) ld->loadFactor = clampf(setObj["load_factor"].as<float>(), 0.5f, 1.6f);
   if (setObj.containsKey("temperature_c")) ld->tempC = setObj["temperature_c"].as<float>();
@@ -3274,9 +3479,11 @@ void handleCommandMessage(const String& payload) {
   // Control block
   if (root.containsKey("control")) {
     JsonObject ctrl = root["control"].as<JsonObject>();
+    bool energyGoalConfigTouched = false;
     if (ctrl.containsKey("MAX_TOTAL_POWER_W") || ctrl.containsKey("POWER_MAX_W") || ctrl.containsKey("P_MAX")) {
       MAX_TOTAL_POWER_W = ctrl.containsKey("MAX_TOTAL_POWER_W") ? ctrl["MAX_TOTAL_POWER_W"].as<float>()
                         : (ctrl.containsKey("POWER_MAX_W") ? ctrl["POWER_MAX_W"].as<float>() : ctrl["P_MAX"].as<float>());
+      energyGoalConfigTouched = true;
     }
     if (ctrl.containsKey("UNDERVOLTAGE_THRESHOLD_V") || ctrl.containsKey("UV_THRESHOLD_V")) {
       float v = ctrl.containsKey("UNDERVOLTAGE_THRESHOLD_V")
@@ -3331,12 +3538,14 @@ void handleCommandMessage(const String& payload) {
         ctrl.containsKey("MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH") ? ctrl["MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH"].as<float>()
       : (ctrl.containsKey("MAX_ENERGY_CONSUMPTION_FOR_DAY_WH") ? ctrl["MAX_ENERGY_CONSUMPTION_FOR_DAY_WH"].as<float>() : ctrl["DAILY_ENERGY_CAP_WH"].as<float>());
       if (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH < 0.0f) MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH = 0.0f;
+      energyGoalConfigTouched = true;
     }
     if (ctrl.containsKey("ENERGY_GOAL_DURATION_SEC") || ctrl.containsKey("ENERGY_GOAL_DURATION_MIN")) {
       float sec = ctrl.containsKey("ENERGY_GOAL_DURATION_SEC")
         ? ctrl["ENERGY_GOAL_DURATION_SEC"].as<float>()
         : (ctrl["ENERGY_GOAL_DURATION_MIN"].as<float>() * 60.0f);
       ENERGY_GOAL_DURATION_SEC = max(60.0f, sec);
+      energyGoalConfigTouched = true;
     }
     if (ctrl.containsKey("ENERGY_GOAL_RATE_W_PER_MIN") || ctrl.containsKey("ENERGY_GOAL_W_PER_MIN")) {
       float rate = ctrl.containsKey("ENERGY_GOAL_RATE_W_PER_MIN")
@@ -3344,9 +3553,11 @@ void handleCommandMessage(const String& payload) {
         : ctrl["ENERGY_GOAL_W_PER_MIN"].as<float>();
       rate = max(0.0f, rate);
       MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH = rate * (ENERGY_GOAL_DURATION_SEC / 60.0f);
+      energyGoalConfigTouched = true;
     }
     if (ctrl.containsKey("ENERGY_GOAL_WH")) {
       MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH = max(0.0f, ctrl["ENERGY_GOAL_WH"].as<float>());
+      energyGoalConfigTouched = true;
     }
     if (ctrl.containsKey("RESTORE_POWER_RATIO") || ctrl.containsKey("RESTORE_THRESHOLD_RATIO") || ctrl.containsKey("RESTORE_FACTOR")) {
       RESTORE_POWER_RATIO = clampf(
@@ -3438,6 +3649,9 @@ void handleCommandMessage(const String& payload) {
         calibrateCurrentZeroOffsets();
       }
     }
+    if (energyGoalConfigTouched) {
+      resetEnergyGoalWindowState("config_changed", millis(), true);
+    }
 
     JsonObject ackCtrl = ack.createNestedObject("control");
     ackCtrl["MAX_TOTAL_POWER_W"] = MAX_TOTAL_POWER_W;
@@ -3462,6 +3676,8 @@ void handleCommandMessage(const String& payload) {
     ackCtrl["ENERGY_GOAL_RATE_W_PER_MIN"] = (ENERGY_GOAL_DURATION_SEC > 0.0f)
       ? (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH / (ENERGY_GOAL_DURATION_SEC / 60.0f))
       : 0.0f;
+    ackCtrl["ENERGY_GOAL_WINDOW_RESET_COUNT"] = energyGoalWindowResetCount;
+    ackCtrl["ENERGY_GOAL_WINDOW_RESET_REASON"] = energyGoalWindowResetReason;
     ackCtrl["RESTORE_POWER_RATIO"] = RESTORE_POWER_RATIO;
     ackCtrl["CONTROL_COOLDOWN_SEC"] = CONTROL_COOLDOWN_SEC;
     ackCtrl["EMERGENCY_STOP"] = emergencyStopActive;
@@ -3849,9 +4065,29 @@ void publishTelemetry(float totalPowerW, float totalCurrentA) {
   float energy1hWh = getWindowEnergyWh(60);
   float energy1dWh = getWindowEnergyWh(24 * 60);
   float energyGoalWh = MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH;
-  float goalWindowWh = getWindowEnergyByDurationSec(ENERGY_GOAL_DURATION_SEC);
+  ensureEnergyGoalWindowConfigured(nowMs);
+  advanceEnergyGoalWindowToMs(nowMs, "window_completed");
+  float goalWindowWh = getCurrentEnergyGoalWindowWh();
   float energyLeftGoalWh = (energyGoalWh > 0.0f) ? max(0.0f, energyGoalWh - goalWindowWh) : 0.0f;
   float energyUsedRatioGoal = (energyGoalWh > 0.0f) ? (goalWindowWh / energyGoalWh) : 0.0f;
+  unsigned long goalWindowDurationMs = energyGoalWindowDurationMs();
+  unsigned long goalWindowElapsedMs = (energyGoalWindowStartMs > 0 && nowMs >= energyGoalWindowStartMs)
+    ? (nowMs - energyGoalWindowStartMs)
+    : 0UL;
+  unsigned long goalWindowRemainingMs = (goalWindowElapsedMs >= goalWindowDurationMs)
+    ? 0UL
+    : (goalWindowDurationMs - goalWindowElapsedMs);
+  float goalWindowRemainingSec = goalWindowRemainingMs / 1000.0f;
+  float goalWindowRemainingRatio = (goalWindowDurationMs > 0)
+    ? ((float)goalWindowRemainingMs / (float)goalWindowDurationMs)
+    : 0.0f;
+  double goalWindowNowEpochSec = (double)time(nullptr);
+  String goalWindowStartedAtUtc = (goalWindowNowEpochSec >= 100000.0 && energyGoalWindowStartMs > 0)
+    ? isoTimestampUtcForEpoch((time_t)(goalWindowNowEpochSec - (double)goalWindowElapsedMs / 1000.0))
+    : String("UNSYNCED_") + String(energyGoalWindowStartMs);
+  String goalWindowEndsAtUtc = (goalWindowNowEpochSec >= 100000.0)
+    ? isoTimestampUtcForEpoch((time_t)(goalWindowNowEpochSec + (double)goalWindowRemainingMs / 1000.0))
+    : String("UNSYNCED_") + String(nowMs + goalWindowRemainingMs);
 
   doc["timestamp"] = isoTimestampUtc();
 
@@ -3927,6 +4163,13 @@ void publishTelemetry(float totalPowerW, float totalCurrentA) {
   system["ENERGY_CONSUMED_GOAL_WINDOW_WH"] = goalWindowWh;
   system["ENERGY_REMAINING_GOAL_WINDOW_WH"] = energyLeftGoalWh;
   system["ENERGY_USED_RATIO_GOAL_WINDOW"] = energyUsedRatioGoal;
+  system["ENERGY_GOAL_WINDOW_STARTED_AT_UTC"] = goalWindowStartedAtUtc;
+  system["ENERGY_GOAL_WINDOW_ENDS_AT_UTC"] = goalWindowEndsAtUtc;
+  system["ENERGY_GOAL_WINDOW_ELAPSED_SEC"] = goalWindowElapsedMs / 1000.0f;
+  system["ENERGY_GOAL_WINDOW_REMAINING_SEC"] = goalWindowRemainingSec;
+  system["ENERGY_GOAL_WINDOW_REMAINING_RATIO"] = goalWindowRemainingRatio;
+  system["ENERGY_GOAL_WINDOW_RESET_COUNT"] = energyGoalWindowResetCount;
+  system["ENERGY_GOAL_WINDOW_RESET_REASON"] = energyGoalWindowResetReason;
   system["scene_enabled"] = sceneEnabled;
   system["scene_lock_active"] = sceneLockActive;
   system["scene_name"] = sceneName;
@@ -4048,6 +4291,13 @@ void publishTelemetry(float totalPowerW, float totalCurrentA) {
   budget["consumed_window_wh"] = goalWindowWh;
   budget["remaining_window_wh"] = energyLeftGoalWh;
   budget["used_ratio_window"] = energyUsedRatioGoal;
+  budget["started_at_utc"] = goalWindowStartedAtUtc;
+  budget["ends_at_utc"] = goalWindowEndsAtUtc;
+  budget["elapsed_sec"] = goalWindowElapsedMs / 1000.0f;
+  budget["remaining_sec"] = goalWindowRemainingSec;
+  budget["remaining_ratio"] = goalWindowRemainingRatio;
+  budget["reset_count"] = energyGoalWindowResetCount;
+  budget["reset_reason"] = energyGoalWindowResetReason;
   // legacy aliases
   budget["goal_1d_wh"] = energyGoalWh;
   budget["consumed_1d_wh"] = energy1dWh;
@@ -4102,6 +4352,7 @@ void publishTelemetry(float totalPowerW, float totalCurrentA) {
     j["duty_applied"] = ld->appliedDuty;
     j["power_w"] = ld->powerW;
     j["current_a"] = ld->currentA;
+    j["energy_goal_window_wh"] = ld->goalWindowEnergyWh;
     j["voltage_v"] = ld->voltageV;
     j["priority"] = ld->priority;
     j["class"] = loadClassToString(ld->loadClass);
@@ -4131,12 +4382,22 @@ void publishTelemetry(float totalPowerW, float totalCurrentA) {
 }
 
 void printTick(float totalPowerW, float totalCurrentA) {
+  const unsigned long nowMs = millis();
   float runtimeSec = max(1.0f, millis() / 1000.0f);
   float energy10mWh = getWindowEnergyWh(10);
   float energy30mWh = getWindowEnergyWh(30);
   float energy1hWh = getWindowEnergyWh(60);
   float energy1dWh = getWindowEnergyWh(24 * 60);
-  float goalWindowWh = getWindowEnergyByDurationSec(ENERGY_GOAL_DURATION_SEC);
+  ensureEnergyGoalWindowConfigured(nowMs);
+  advanceEnergyGoalWindowToMs(nowMs, "window_completed");
+  float goalWindowWh = getCurrentEnergyGoalWindowWh();
+  unsigned long goalWindowDurationMs = energyGoalWindowDurationMs();
+  unsigned long goalWindowElapsedMs = (energyGoalWindowStartMs > 0 && nowMs >= energyGoalWindowStartMs)
+    ? (nowMs - energyGoalWindowStartMs)
+    : 0UL;
+  unsigned long goalWindowRemainingMs = (goalWindowElapsedMs >= goalWindowDurationMs)
+    ? 0UL
+    : (goalWindowDurationMs - goalWindowElapsedMs);
 
   Serial.println();
   Serial.println("======================================================================");
@@ -4226,12 +4487,15 @@ void printTick(float totalPowerW, float totalCurrentA) {
     energy1dWh, (energy1dWh * 3600.0f) / min(runtimeSec, 24.0f * 60.0f * 60.0f)
   );
   Serial.printf(
-    "         goal=%.2fWh window=%.1fmin consumed=%.2fWh left=%.2fWh used=%.2f%%\n",
+    "         goal=%.2fWh window=%.1fmin consumed=%.2fWh left=%.2fWh used=%.2f%% time_left=%.1fs resets=%lu reason=%s\n",
     MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH,
     ENERGY_GOAL_DURATION_SEC / 60.0f,
     goalWindowWh,
     (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f) ? max(0.0f, MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH - goalWindowWh) : 0.0f,
-    (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f) ? (goalWindowWh / MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH) * 100.0f : 0.0f
+    (MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH > 0.0f) ? (goalWindowWh / MAX_ENERGY_CONSUMPTION_FOR_THR_DAY_WH) * 100.0f : 0.0f,
+    goalWindowRemainingMs / 1000.0f,
+    energyGoalWindowResetCount,
+    energyGoalWindowResetReason
   );
   double nowEpochSec = (double)time(nullptr);
   float predictionAgeMs = 0.0f;
@@ -4584,6 +4848,7 @@ void setup() {
   ensureMqttConnected();
 
   currentMinuteBucketStartMs = millis();
+  resetEnergyGoalWindowState("startup", currentMinuteBucketStartMs, false);
   sceneStartMs = millis();
 
   // Publish online status

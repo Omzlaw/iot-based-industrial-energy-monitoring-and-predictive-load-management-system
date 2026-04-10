@@ -32,12 +32,35 @@ TOPIC_TELEMETRY_NAME = f"dt/{PLANT_IDENTIFIER}/telemetry"
 TOPIC_PREDICTION_NAME = f"dt/{PLANT_IDENTIFIER}/prediction"
 TOPIC_PREDICTION_LONG_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long"
 TOPIC_PREDICTION_LONG_LSTM_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long_lstm"
+TOPIC_COMMAND_NAME = f"dt/{PLANT_IDENTIFIER}/cmd"
+TOPIC_COMMAND_ACK_NAME = f"dt/{PLANT_IDENTIFIER}/cmd_ack"
+TOPIC_PREDICTOR_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_cmd"
+TOPIC_PREDICTOR_LONG_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_long_cmd"
+TOPIC_PREDICTOR_LONG_LSTM_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_long_lstm_cmd"
+TOPIC_PREDICTION_LONG_STATUS_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long_status"
+TOPIC_PREDICTION_LONG_LSTM_STATUS_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long_lstm_status"
 TOPICS_TO_LOG = [
     TOPIC_TELEMETRY_NAME,
     TOPIC_PREDICTION_NAME,
     TOPIC_PREDICTION_LONG_NAME,
     TOPIC_PREDICTION_LONG_LSTM_NAME,
+    TOPIC_COMMAND_NAME,
+    TOPIC_COMMAND_ACK_NAME,
+    TOPIC_PREDICTOR_CMD_NAME,
+    TOPIC_PREDICTOR_LONG_CMD_NAME,
+    TOPIC_PREDICTOR_LONG_LSTM_CMD_NAME,
+    TOPIC_PREDICTION_LONG_STATUS_NAME,
+    TOPIC_PREDICTION_LONG_LSTM_STATUS_NAME,
 ]
+RAW_TOPICS_TO_LOG = {
+    TOPIC_COMMAND_NAME,
+    TOPIC_COMMAND_ACK_NAME,
+    TOPIC_PREDICTOR_CMD_NAME,
+    TOPIC_PREDICTOR_LONG_CMD_NAME,
+    TOPIC_PREDICTOR_LONG_LSTM_CMD_NAME,
+    TOPIC_PREDICTION_LONG_STATUS_NAME,
+    TOPIC_PREDICTION_LONG_LSTM_STATUS_NAME,
+}
 
 _DEFAULT_LOG_DIR = os.path.join(os.path.dirname(__file__), "telemetry_logs")
 LOGGER_OUTPUT_DIR = os.getenv("LOGGER_OUTPUT_DIR", _DEFAULT_LOG_DIR).strip() or _DEFAULT_LOG_DIR
@@ -330,10 +353,34 @@ def _update_topic_state(topic: str, state: dict, payload: dict):
     if topic == TOPIC_TELEMETRY_NAME:
         system = payload.get("system", {}) if isinstance(payload.get("system"), dict) else {}
         energy = payload.get("energy", {}) if isinstance(payload.get("energy"), dict) else {}
+        environment = payload.get("environment", {}) if isinstance(payload.get("environment"), dict) else {}
+        process = payload.get("process", {}) if isinstance(payload.get("process"), dict) else {}
+        loads = payload.get("loads", {}) if isinstance(payload.get("loads"), dict) else {}
+        tank1 = process.get("tank1", {}) if isinstance(process.get("tank1"), dict) else {}
+        tank2 = process.get("tank2", {}) if isinstance(process.get("tank2"), dict) else {}
+        process_kpi = process.get("kpi", {}) if isinstance(process.get("kpi"), dict) else {}
         _update_metric(state, "total_power_w", system.get("total_power_w"))
         _update_metric(state, "total_current_a", system.get("total_current_a"))
         _update_metric(state, "supply_v", system.get("supply_v"))
         _update_metric(state, "total_energy_wh", energy.get("total_energy_wh"))
+        _update_metric(state, "environment_temperature_c", environment.get("temperature_c"))
+        _update_metric(state, "environment_humidity_pct", environment.get("humidity_pct"))
+        _update_metric(state, "process_tank1_level_pct", process.get("tank1_level_pct", tank1.get("level_pct")))
+        _update_metric(state, "process_tank2_level_pct", process.get("tank2_level_pct", tank2.get("level_pct")))
+        _update_metric(state, "process_tank1_temp_c", process.get("tank1_temp_c", tank1.get("temperature_c")))
+        _update_metric(state, "process_tank2_temp_c", process.get("tank2_temp_c", tank2.get("temperature_c")))
+        _update_metric(state, "process_tank1_ultrasonic_distance_cm", process.get("tank1_ultrasonic_distance_cm", tank1.get("ultrasonic_distance_cm")))
+        _update_metric(state, "process_tank2_ultrasonic_distance_cm", process.get("tank2_ultrasonic_distance_cm", tank2.get("ultrasonic_distance_cm")))
+        _update_metric(state, "process_tank1_ultrasonic_raw_cm", process.get("tank1_ultrasonic_raw_cm", tank1.get("ultrasonic_raw_cm")))
+        _update_metric(state, "process_tank2_ultrasonic_raw_cm", process.get("tank2_ultrasonic_raw_cm", tank2.get("ultrasonic_raw_cm")))
+        _update_metric(state, "process_balance_delta_level_pct", process_kpi.get("balance_delta_level_pct"))
+        for load_name, load_data in loads.items():
+            if not isinstance(load_data, dict):
+                continue
+            _update_metric(state, f"load_{load_name}_on_ratio", 1.0 if bool(load_data.get("on", False)) else 0.0)
+            _update_metric(state, f"load_{load_name}_duty_applied_avg", load_data.get("duty_applied", load_data.get("duty")))
+            _update_metric(state, f"load_{load_name}_power_w_avg", load_data.get("power_w"))
+            _update_metric(state, f"load_{load_name}_current_a_avg", load_data.get("current_a"))
         return
 
     # Prediction topics
@@ -350,11 +397,15 @@ def _build_telemetry_aggregate_payload(state: dict):
     last_payload = state.get("last_payload") or {}
     last_system = last_payload.get("system", {}) if isinstance(last_payload.get("system"), dict) else {}
     last_energy = last_payload.get("energy", {}) if isinstance(last_payload.get("energy"), dict) else {}
+    last_environment = last_payload.get("environment", {}) if isinstance(last_payload.get("environment"), dict) else {}
+    last_process = last_payload.get("process", {}) if isinstance(last_payload.get("process"), dict) else {}
 
     avg_power = _metric_avg(state, "total_power_w")
     avg_current = _metric_avg(state, "total_current_a")
     avg_supply_v = _metric_avg(state, "supply_v")
     last_energy_wh = _metric_last(state, "total_energy_wh")
+    avg_environment_temp_c = _metric_avg(state, "environment_temperature_c")
+    avg_environment_humidity_pct = _metric_avg(state, "environment_humidity_pct")
 
     if avg_power is None:
         avg_power = _safe_float(last_system.get("total_power_w"))
@@ -364,6 +415,10 @@ def _build_telemetry_aggregate_payload(state: dict):
         avg_supply_v = _safe_float(last_system.get("supply_v"))
     if last_energy_wh is None:
         last_energy_wh = _safe_float(last_energy.get("total_energy_wh"))
+    if avg_environment_temp_c is None:
+        avg_environment_temp_c = _safe_float(last_environment.get("temperature_c"))
+    if avg_environment_humidity_pct is None:
+        avg_environment_humidity_pct = _safe_float(last_environment.get("humidity_pct"))
 
     system_payload = dict(last_system)
     system_payload.update(
@@ -378,6 +433,61 @@ def _build_telemetry_aggregate_payload(state: dict):
 
     energy_payload = dict(last_energy)
     energy_payload["total_energy_wh"] = _round(last_energy_wh, 4)
+
+    environment_payload = dict(last_environment)
+    if avg_environment_temp_c is not None:
+        environment_payload["temperature_c"] = _round(avg_environment_temp_c, 4)
+    if avg_environment_humidity_pct is not None:
+        environment_payload["humidity_pct"] = _round(avg_environment_humidity_pct, 4)
+
+    process_payload = dict(last_process)
+    process_tank1 = dict(last_process.get("tank1", {}) if isinstance(last_process.get("tank1"), dict) else {})
+    process_tank2 = dict(last_process.get("tank2", {}) if isinstance(last_process.get("tank2"), dict) else {})
+    process_kpi = dict(last_process.get("kpi", {}) if isinstance(last_process.get("kpi"), dict) else {})
+
+    process_analog_map = {
+        "tank1_level_pct": "process_tank1_level_pct",
+        "tank2_level_pct": "process_tank2_level_pct",
+        "tank1_temp_c": "process_tank1_temp_c",
+        "tank2_temp_c": "process_tank2_temp_c",
+        "tank1_ultrasonic_distance_cm": "process_tank1_ultrasonic_distance_cm",
+        "tank2_ultrasonic_distance_cm": "process_tank2_ultrasonic_distance_cm",
+        "tank1_ultrasonic_raw_cm": "process_tank1_ultrasonic_raw_cm",
+        "tank2_ultrasonic_raw_cm": "process_tank2_ultrasonic_raw_cm",
+    }
+    for process_key, metric_key in process_analog_map.items():
+        avg_value = _metric_avg(state, metric_key)
+        if avg_value is not None:
+            process_payload[process_key] = _round(avg_value, 4)
+
+    process_kpi_balance = _metric_avg(state, "process_balance_delta_level_pct")
+    if process_kpi_balance is not None:
+        process_kpi["balance_delta_level_pct"] = _round(process_kpi_balance, 4)
+
+    if "tank1_level_pct" in process_payload:
+        process_tank1["level_pct"] = process_payload["tank1_level_pct"]
+    if "tank1_temp_c" in process_payload:
+        process_tank1["temperature_c"] = process_payload["tank1_temp_c"]
+    if "tank1_ultrasonic_distance_cm" in process_payload:
+        process_tank1["ultrasonic_distance_cm"] = process_payload["tank1_ultrasonic_distance_cm"]
+    if "tank1_ultrasonic_raw_cm" in process_payload:
+        process_tank1["ultrasonic_raw_cm"] = process_payload["tank1_ultrasonic_raw_cm"]
+
+    if "tank2_level_pct" in process_payload:
+        process_tank2["level_pct"] = process_payload["tank2_level_pct"]
+    if "tank2_temp_c" in process_payload:
+        process_tank2["temperature_c"] = process_payload["tank2_temp_c"]
+    if "tank2_ultrasonic_distance_cm" in process_payload:
+        process_tank2["ultrasonic_distance_cm"] = process_payload["tank2_ultrasonic_distance_cm"]
+    if "tank2_ultrasonic_raw_cm" in process_payload:
+        process_tank2["ultrasonic_raw_cm"] = process_payload["tank2_ultrasonic_raw_cm"]
+
+    if process_tank1:
+        process_payload["tank1"] = process_tank1
+    if process_tank2:
+        process_payload["tank2"] = process_tank2
+    if process_kpi:
+        process_payload["kpi"] = process_kpi
 
     output = {
         "schema_version": "1.0",
@@ -394,13 +504,51 @@ def _build_telemetry_aggregate_payload(state: dict):
             "total_current_a": _metric_summary(state, "total_current_a"),
             "supply_v": _metric_summary(state, "supply_v"),
             "total_energy_wh": _metric_summary(state, "total_energy_wh"),
+            "environment_temperature_c": _metric_summary(state, "environment_temperature_c"),
+            "environment_humidity_pct": _metric_summary(state, "environment_humidity_pct"),
+            "process_tank1_level_pct": _metric_summary(state, "process_tank1_level_pct"),
+            "process_tank2_level_pct": _metric_summary(state, "process_tank2_level_pct"),
+            "process_tank1_temp_c": _metric_summary(state, "process_tank1_temp_c"),
+            "process_tank2_temp_c": _metric_summary(state, "process_tank2_temp_c"),
+            "process_tank1_ultrasonic_distance_cm": _metric_summary(state, "process_tank1_ultrasonic_distance_cm"),
+            "process_tank2_ultrasonic_distance_cm": _metric_summary(state, "process_tank2_ultrasonic_distance_cm"),
+            "process_tank1_ultrasonic_raw_cm": _metric_summary(state, "process_tank1_ultrasonic_raw_cm"),
+            "process_tank2_ultrasonic_raw_cm": _metric_summary(state, "process_tank2_ultrasonic_raw_cm"),
+            "process_balance_delta_level_pct": _metric_summary(state, "process_balance_delta_level_pct"),
         },
     }
 
-    for key in ("environment", "process", "loads", "evaluation", "prediction_context", "voltages"):
+    if environment_payload:
+        output["environment"] = environment_payload
+
+    if process_payload:
+        output["process"] = process_payload
+
+    for key in ("loads", "evaluation", "prediction_context", "voltages"):
         value = last_payload.get(key)
         if isinstance(value, dict):
             output[key] = value
+
+    loads_payload = output.get("loads")
+    if isinstance(loads_payload, dict):
+        for load_name, load_data in loads_payload.items():
+            if not isinstance(load_data, dict):
+                continue
+            on_ratio_avg = _metric_avg(state, f"load_{load_name}_on_ratio")
+            duty_avg = _metric_avg(state, f"load_{load_name}_duty_applied_avg")
+            power_avg = _metric_avg(state, f"load_{load_name}_power_w_avg")
+            current_avg = _metric_avg(state, f"load_{load_name}_current_a_avg")
+            if on_ratio_avg is not None:
+                load_data["on_ratio"] = _round(on_ratio_avg, 4)
+            if duty_avg is not None:
+                load_data["duty_end"] = load_data.get("duty")
+                load_data["duty"] = _round(duty_avg, 4)
+                load_data["duty_applied_avg"] = _round(duty_avg, 4)
+                load_data["duty_applied"] = _round(duty_avg, 4)
+            if power_avg is not None:
+                load_data["power_w"] = _round(power_avg, 4)
+            if current_avg is not None:
+                load_data["current_a"] = _round(current_avg, 4)
 
     return output
 
@@ -521,6 +669,10 @@ def on_message(client, userdata, msg):
         return
 
     try:
+        if msg.topic in RAW_TOPICS_TO_LOG:
+            _append_record(msg.topic, payload)
+            return
+
         _log_critical_events(msg.topic, payload)
 
         now_sec = int(time.time())

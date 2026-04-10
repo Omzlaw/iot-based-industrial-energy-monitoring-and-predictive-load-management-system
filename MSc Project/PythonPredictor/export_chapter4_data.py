@@ -4,11 +4,12 @@ import csv
 import json
 import math
 import os
-from collections import defaultdict
+import shutil
+from collections import defaultdict, deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 try:
@@ -33,7 +34,19 @@ TOPIC_TELEMETRY_NAME = f"dt/{PLANT_IDENTIFIER}/telemetry"
 TOPIC_PREDICTION_NAME = f"dt/{PLANT_IDENTIFIER}/prediction"
 TOPIC_PREDICTION_LONG_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long"
 TOPIC_PREDICTION_LONG_LSTM_NAME = f"dt/{PLANT_IDENTIFIER}/prediction_long_lstm"
+TOPIC_COMMAND_NAME = f"dt/{PLANT_IDENTIFIER}/cmd"
+TOPIC_COMMAND_ACK_NAME = f"dt/{PLANT_IDENTIFIER}/cmd_ack"
+TOPIC_PREDICTOR_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_cmd"
+TOPIC_PREDICTOR_LONG_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_long_cmd"
+TOPIC_PREDICTOR_LONG_LSTM_CMD_NAME = f"dt/{PLANT_IDENTIFIER}/predictor_long_lstm_cmd"
 tariff_config_path = Path(TARIFF_CONFIG_PATH)
+MODEL_DIR = Path(__file__).resolve().parent / "models"
+RF_MODEL_DIR_ENV = os.getenv("LONG_RF_MODEL_DIR", "").strip()
+LSTM_MODEL_DIR_ENV = os.getenv("LONG_LSTM_MODEL_DIR", "").strip()
+MODEL_SERVICE_DIR_HINTS = {
+    "rf": ("long", "long-rf", "predictor-long-rf", "rf"),
+    "lstm": ("lstm", "long-lstm", "predictor-long-lstm"),
+}
 
 
 def _safe_float(value) -> Optional[float]:
@@ -57,6 +70,16 @@ def _safe_bool(value) -> Optional[bool]:
     if text in ("0", "false", "no", "off"):
         return False
     return None
+
+
+def _extract_logged_topic_payload(record: dict) -> Tuple[str, Optional[dict]]:
+    topic = str(record.get("topic") or "")
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        return topic, payload
+    if topic and isinstance(record.get("system"), dict):
+        return topic, record
+    return topic, None
 
 
 def _env_number(*keys: str, default: float) -> float:
@@ -208,6 +231,66 @@ DEFAULT_TARIFF_VERSION = {
     "weekends_offpeak": True,
     "bank_holidays_offpeak": True,
 }
+
+DEFAULT_ROLLING_WINDOW_MINUTES = [1, 5, 15, 30, 60, 180, 360, 1440, 10080, 43200]
+
+
+def _parse_rolling_window_minutes(raw: Optional[str]) -> List[int]:
+    if raw is None:
+        return list(DEFAULT_ROLLING_WINDOW_MINUTES)
+    values: List[int] = []
+    for part in str(raw).split(","):
+        text = str(part).strip()
+        if not text:
+            continue
+        try:
+            minutes = int(round(float(text)))
+        except Exception:
+            continue
+        if minutes <= 0:
+            continue
+        values.append(minutes)
+    unique = sorted({value for value in values if value > 0})
+    return unique or list(DEFAULT_ROLLING_WINDOW_MINUTES)
+
+
+ROLLING_WINDOW_MINUTES = _parse_rolling_window_minutes(
+    os.getenv("ROLLING_WINDOW_MINUTES") or os.getenv("EXPORT_ROLLING_WINDOW_MINUTES")
+)
+
+
+def _merge_rolling_window_minutes(base_minutes: Sequence[int], extra_minutes: Sequence[int]) -> List[int]:
+    merged = {int(minutes) for minutes in base_minutes if int(minutes) > 0}
+    merged.update(int(minutes) for minutes in extra_minutes if int(minutes) > 0)
+    return sorted(merged)
+
+
+def _window_minutes_for_horizon(horizon_sec: Optional[float]) -> Optional[int]:
+    horizon = _safe_float(horizon_sec)
+    if horizon is None or horizon <= 0:
+        return None
+    minutes = int(round(horizon / 60.0))
+    return minutes if minutes > 0 else None
+
+
+def _prediction_window_minutes(prediction_rows: Sequence[dict]) -> List[int]:
+    extra: List[int] = []
+    for row in prediction_rows:
+        for key in ("pred_short_horizon_sec", "pred_long_rf_horizon_sec", "pred_long_lstm_horizon_sec"):
+            minutes = _window_minutes_for_horizon(row.get(key))
+            if minutes is not None:
+                extra.append(minutes)
+    return sorted({value for value in extra if value > 0})
+
+
+def _rolling_window_label(minutes: int) -> str:
+    if minutes % 10080 == 0:
+        return f"{minutes // 10080}w"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}min"
 
 
 def _default_tariff_store() -> Dict[str, object]:
@@ -510,7 +593,11 @@ def _csv_row_count(path: Path) -> int:
         return sum(1 for _ in reader)
 
 
-def _attach_cost_fields(system_rows: List[dict], tariff_store: dict) -> List[dict]:
+def _attach_cost_fields(
+    system_rows: List[dict],
+    tariff_store: dict,
+    rolling_window_minutes: Optional[Sequence[int]] = None,
+) -> List[dict]:
     if not system_rows:
         return system_rows
 
@@ -519,6 +606,11 @@ def _attach_cost_fields(system_rows: List[dict], tariff_store: dict) -> List[dic
     accumulated_energy_cost = 0.0
     running_max_demand_kw = 0.0
     interval_buckets: Dict[Tuple[int, int], float] = {}
+    window_minutes_list = list(rolling_window_minutes or ROLLING_WINDOW_MINUTES)
+    rolling_specs = [(int(minutes), _rolling_window_label(int(minutes))) for minutes in window_minutes_list]
+    rolling_segments = {minutes: deque() for minutes, _ in rolling_specs}
+    rolling_energy_totals = {minutes: 0.0 for minutes, _ in rolling_specs}
+    rolling_cost_totals = {minutes: 0.0 for minutes, _ in rolling_specs}
 
     for row in system_rows:
         ts = int(row["ts"])
@@ -573,6 +665,46 @@ def _attach_cost_fields(system_rows: List[dict], tariff_store: dict) -> List[dic
         demand_charge_cost = running_max_demand_kw * demand_charge_rate_per_kw
         total_cost = accumulated_energy_cost + demand_charge_cost
 
+        if previous_ts is not None and ts > previous_ts:
+            segment = {
+                "start_ms": int(previous_ts),
+                "end_ms": int(ts),
+                "energy_wh": float(delta_energy_wh),
+                "cost": float(incremental_energy_cost),
+            }
+            for window_minutes, _label in rolling_specs:
+                window_queue = rolling_segments[window_minutes]
+                window_queue.append(segment)
+                rolling_energy_totals[window_minutes] += float(delta_energy_wh)
+                rolling_cost_totals[window_minutes] += float(incremental_energy_cost)
+
+        for window_minutes, window_label in rolling_specs:
+            window_queue = rolling_segments[window_minutes]
+            window_start_ms = ts - (window_minutes * 60000)
+            while window_queue and int(window_queue[0]["end_ms"]) <= window_start_ms:
+                expired = window_queue.popleft()
+                rolling_energy_totals[window_minutes] -= float(expired["energy_wh"])
+                rolling_cost_totals[window_minutes] -= float(expired["cost"])
+
+            window_energy_wh = float(rolling_energy_totals[window_minutes])
+            window_cost = float(rolling_cost_totals[window_minutes])
+            if window_queue:
+                head = window_queue[0]
+                head_start = int(head["start_ms"])
+                head_end = int(head["end_ms"])
+                if head_start < window_start_ms < head_end:
+                    head_span_ms = max(1, head_end - head_start)
+                    outside_ratio = (window_start_ms - head_start) / head_span_ms
+                    window_energy_wh -= float(head["energy_wh"]) * outside_ratio
+                    window_cost -= float(head["cost"]) * outside_ratio
+
+            window_energy_wh = max(0.0, window_energy_wh)
+            window_cost = max(0.0, window_cost)
+            window_avg_power_w = window_energy_wh / (window_minutes / 60.0)
+            row[f"rolling_energy_{window_label}_wh"] = window_energy_wh
+            row[f"rolling_avg_power_{window_label}_w"] = window_avg_power_w
+            row[f"rolling_cost_{window_label}"] = window_cost
+
         row["cost_tariff_state"] = cost_tariff_state
         row["cost_tariff_rate_per_kwh"] = cost_tariff_rate_per_kwh
         row["incremental_energy_cost"] = incremental_energy_cost
@@ -598,11 +730,17 @@ def _prediction_row(ts_ms: int) -> Dict[str, Optional[float]]:
         "actual_current_a": None,
         "actual_total_energy_wh": None,
         "pred_short_power_w": None,
+        "pred_short_window_energy_wh": None,
         "pred_short_total_energy_wh": None,
+        "pred_short_horizon_sec": None,
         "pred_long_rf_power_w": None,
+        "pred_long_rf_window_energy_wh": None,
         "pred_long_rf_total_energy_wh": None,
+        "pred_long_rf_horizon_sec": None,
         "pred_long_lstm_power_w": None,
+        "pred_long_lstm_window_energy_wh": None,
         "pred_long_lstm_total_energy_wh": None,
+        "pred_long_lstm_horizon_sec": None,
     }
 
 
@@ -627,6 +765,138 @@ def _resolve_fused_predicted_energy(system_row: dict) -> Optional[float]:
             best_diff = diff
             best_energy = energy_wh
     return best_energy
+
+
+def _derive_predicted_total_energy(
+    actual_total_energy_wh: Optional[float],
+    predicted_power_w: Optional[float],
+    predicted_total_energy_wh: Optional[float],
+    horizon_sec: Optional[float],
+) -> Optional[float]:
+    if predicted_total_energy_wh is not None:
+        return predicted_total_energy_wh
+    if actual_total_energy_wh is None or predicted_power_w is None:
+        return None
+    horizon = _safe_float(horizon_sec)
+    if horizon is None or horizon <= 0:
+        return None
+    return float(actual_total_energy_wh) + (float(predicted_power_w) * float(horizon) / 3600.0)
+
+
+def _derive_predicted_window_energy(predicted_power_w: Optional[float], horizon_sec: Optional[float]) -> Optional[float]:
+    power_w = _safe_float(predicted_power_w)
+    horizon = _safe_float(horizon_sec)
+    if power_w is None or horizon is None or horizon <= 0:
+        return None
+    return float(power_w) * float(horizon) / 3600.0
+
+
+def _derive_predicted_window_cost(predicted_window_energy_wh: Optional[float], tariff_rate_per_kwh: Optional[float]) -> Optional[float]:
+    energy_wh = _safe_float(predicted_window_energy_wh)
+    rate_per_kwh = _safe_float(tariff_rate_per_kwh)
+    if energy_wh is None or rate_per_kwh is None:
+        return None
+    return float(energy_wh) * (float(rate_per_kwh) / 1000.0)
+
+
+def _derive_window_avg_power_w(
+    power_w: Optional[float],
+    window_energy_wh: Optional[float],
+    window_minutes: Optional[float],
+) -> Optional[float]:
+    candidate_power_w = _safe_float(power_w)
+    if candidate_power_w is not None:
+        return candidate_power_w
+    energy_wh = _safe_float(window_energy_wh)
+    minutes = _safe_float(window_minutes)
+    if energy_wh is None or minutes is None or minutes <= 0:
+        return None
+    return float(energy_wh) / (float(minutes) / 60.0)
+
+
+def _build_prediction_comparison_rows(
+    prediction_rows: Sequence[dict],
+    system_rows: Sequence[dict],
+    prediction_step_sec: int,
+    predicted_power_key: str,
+    predicted_window_energy_key: str,
+    predicted_total_energy_key: str,
+    horizon_key: str,
+) -> List[dict]:
+    system_by_bucket: Dict[int, dict] = {}
+    for row in system_rows:
+        system_by_bucket[_bucket_ms(int(row["ts"]), prediction_step_sec)] = row
+
+    output_rows: List[dict] = []
+    for row in prediction_rows:
+        system_row = system_by_bucket.get(int(row["ts"]))
+        horizon_sec = row.get(horizon_key)
+        window_minutes = _window_minutes_for_horizon(horizon_sec)
+        window_label = _rolling_window_label(window_minutes) if window_minutes is not None else None
+        predicted_window_energy_wh = _safe_float(row.get(predicted_window_energy_key))
+        if predicted_window_energy_wh is None:
+            predicted_window_energy_wh = _derive_predicted_window_energy(row.get(predicted_power_key), horizon_sec)
+        tariff_rate_per_kwh = system_row.get("cost_tariff_rate_per_kwh") if system_row else None
+        output_rows.append(
+            {
+                "ts": row["ts"],
+                "label_utc": row["label_utc"],
+                "horizon_sec": horizon_sec,
+                "rolling_window_minutes": window_minutes,
+                "rolling_window_label": window_label,
+                "actual_power_w": row.get("actual_power_w"),
+                "predicted_power_w": row.get(predicted_power_key),
+                "actual_rolling_energy_wh": system_row.get(f"rolling_energy_{window_label}_wh") if system_row and window_label else None,
+                "predicted_rolling_energy_wh": predicted_window_energy_wh,
+                "actual_rolling_avg_power_w": system_row.get(f"rolling_avg_power_{window_label}_w") if system_row and window_label else None,
+                "predicted_rolling_avg_power_w": _derive_window_avg_power_w(row.get(predicted_power_key), predicted_window_energy_wh, window_minutes),
+                "cost_tariff_rate_per_kwh": tariff_rate_per_kwh,
+                "cost_tariff_state": system_row.get("cost_tariff_state") if system_row else None,
+                "actual_rolling_cost": system_row.get(f"rolling_cost_{window_label}") if system_row and window_label else None,
+                "predicted_rolling_cost": _derive_predicted_window_cost(predicted_window_energy_wh, tariff_rate_per_kwh),
+                "actual_cumulative_total_energy_wh": row.get("actual_total_energy_wh"),
+                "predicted_cumulative_total_energy_wh": row.get(predicted_total_energy_key),
+            }
+        )
+    if output_rows:
+        samples: deque = deque()
+        for row in output_rows:
+            ts = int(row["ts"])
+            actual_total_energy_wh = _safe_float(row.get("actual_cumulative_total_energy_wh"))
+            window_minutes = _safe_float(row.get("rolling_window_minutes"))
+            if actual_total_energy_wh is not None:
+                samples.append({"ts": ts, "energy_wh": actual_total_energy_wh})
+            if window_minutes is None or window_minutes <= 0:
+                continue
+            window_ms = int(window_minutes * 60000.0)
+            while len(samples) >= 2 and int(samples[1]["ts"]) <= (ts - window_ms):
+                samples.popleft()
+            if actual_total_energy_wh is None or not samples:
+                continue
+            derived_actual_window_energy_wh: Optional[float] = None
+            window_start_ms = ts - window_ms
+            if len(samples) == 1:
+                only = samples[0]
+                if int(only["ts"]) >= window_start_ms:
+                    derived_actual_window_energy_wh = max(0.0, actual_total_energy_wh)
+            else:
+                baseline = float(samples[0]["energy_wh"])
+                if int(samples[0]["ts"]) < window_start_ms < int(samples[1]["ts"]):
+                    a = samples[0]
+                    b = samples[1]
+                    span_ms = max(1, int(b["ts"]) - int(a["ts"]))
+                    ratio = (window_start_ms - int(a["ts"])) / span_ms
+                    baseline = float(a["energy_wh"]) + (float(b["energy_wh"]) - float(a["energy_wh"])) * ratio
+                derived_actual_window_energy_wh = max(0.0, actual_total_energy_wh - baseline)
+            if derived_actual_window_energy_wh is None:
+                continue
+            existing_actual_window_energy_wh = _safe_float(row.get("actual_rolling_energy_wh"))
+            if existing_actual_window_energy_wh is None or (
+                existing_actual_window_energy_wh <= 0.0 and derived_actual_window_energy_wh > 0.0
+            ):
+                row["actual_rolling_energy_wh"] = derived_actual_window_energy_wh
+                row["actual_rolling_avg_power_w"] = derived_actual_window_energy_wh / (float(window_minutes) / 60.0)
+    return output_rows
 
 
 def _best_lag_sec(actual: List[Optional[float]], predicted: List[Optional[float]], step_sec: int, max_lag_sec: int) -> Tuple[Optional[int], int]:
@@ -660,32 +930,91 @@ def _best_lag_sec(actual: List[Optional[float]], predicted: List[Optional[float]
     return best_shift * step_sec, best_count
 
 
-def _compute_model_metrics(rows: List[dict], pred_col: str, step_sec: int, max_lag_sec: int) -> dict:
-    pairs = [(row["actual_power_w"], row[pred_col]) for row in rows if row["actual_power_w"] is not None and row[pred_col] is not None]
+def _infer_metric_step_sec(rows: Sequence[dict], fallback_step_sec: int) -> int:
+    timestamps = [int(row["ts"]) for row in rows if row.get("ts") is not None]
+    if len(timestamps) < 2:
+        return max(1, int(fallback_step_sec))
+    timestamps.sort()
+    deltas_sec = []
+    previous_ts = timestamps[0]
+    for ts in timestamps[1:]:
+        delta_ms = int(ts) - int(previous_ts)
+        previous_ts = ts
+        if delta_ms > 0:
+            deltas_sec.append(delta_ms / 1000.0)
+    if not deltas_sec:
+        return max(1, int(fallback_step_sec))
+    deltas_sec.sort()
+    middle = len(deltas_sec) // 2
+    if len(deltas_sec) % 2 == 1:
+        median_sec = deltas_sec[middle]
+    else:
+        median_sec = (deltas_sec[middle - 1] + deltas_sec[middle]) / 2.0
+    return max(1, int(round(median_sec)))
+
+
+def _summarize_horizon_sec(rows: Sequence[dict]) -> Optional[float]:
+    values = sorted(
+        _safe_float(row.get("horizon_sec"))
+        for row in rows
+        if _safe_float(row.get("horizon_sec")) is not None and _safe_float(row.get("horizon_sec")) > 0.0
+    )
+    if not values:
+        return None
+    middle = len(values) // 2
+    if len(values) % 2 == 1:
+        return float(values[middle])
+    return float((values[middle - 1] + values[middle]) / 2.0)
+
+
+def _compute_model_metrics(rows: List[dict], actual_col: str, pred_col: str, step_sec: int, max_lag_sec: int) -> dict:
+    pairs = [(row[actual_col], row[pred_col]) for row in rows if row.get(actual_col) is not None and row.get(pred_col) is not None]
     sample_count = len(pairs)
     if not pairs:
         return {
             "sample_count": 0,
-            "mae_w": None,
-            "rmse_w": None,
+            "mae_wh": None,
+            "mse_wh2": None,
+            "rmse_wh": None,
+            "r_squared": None,
             "lag_sec": None,
             "lag_eval_samples": 0,
+            "metric_step_sec": max(1, int(step_sec)),
         }
 
+    actual_values = [actual for actual, _pred in pairs]
     errors = [abs(actual - pred) for actual, pred in pairs]
     squared = [(actual - pred) ** 2 for actual, pred in pairs]
+    actual_mean = sum(actual_values) / sample_count if sample_count else None
+    total_sum_squares = (
+        sum((actual - actual_mean) ** 2 for actual in actual_values)
+        if actual_mean is not None
+        else None
+    )
+    residual_sum_squares = sum(squared)
+    mse = residual_sum_squares / sample_count
+    r_squared = None
+    if total_sum_squares is not None:
+        if total_sum_squares > 0.0:
+            r_squared = 1.0 - (residual_sum_squares / total_sum_squares)
+        elif residual_sum_squares <= 0.0:
+            r_squared = 1.0
+    metric_step_sec = _infer_metric_step_sec(rows, step_sec)
     lag_sec, lag_samples = _best_lag_sec(
-        [row["actual_power_w"] for row in rows],
+        [row.get(actual_col) for row in rows],
         [row[pred_col] for row in rows],
-        step_sec,
+        metric_step_sec,
         max_lag_sec,
     )
     return {
         "sample_count": sample_count,
-        "mae_w": sum(errors) / sample_count,
-        "rmse_w": math.sqrt(sum(squared) / sample_count),
+        "mae_wh": sum(errors) / sample_count,
+        "mse_wh2": mse,
+        "rmse_wh": math.sqrt(mse),
+        "r_squared": r_squared,
         "lag_sec": lag_sec,
         "lag_eval_samples": lag_samples,
+        "metric_step_sec": metric_step_sec,
     }
 
 
@@ -823,6 +1152,731 @@ def _build_policy_summary_rows(system_rows: List[dict]) -> List[dict]:
     return rows
 
 
+def _field_delta(rows: Sequence[dict], key: str) -> Optional[float]:
+    values = []
+    for row in rows:
+        value = _safe_float(row.get(key))
+        if value is not None:
+            values.append(value)
+    if not values:
+        return None
+    return max(values) - min(values)
+
+
+def _series_timing_row(
+    stream_name: str,
+    ts_values_ms: Sequence[int],
+    *,
+    fresh_values: Optional[Sequence[Optional[bool]]] = None,
+    applied_values: Optional[Sequence[Optional[bool]]] = None,
+) -> dict:
+    cleaned = sorted(int(ts) for ts in ts_values_ms if ts is not None)
+    intervals_sec = [
+        max(0.0, (cleaned[index] - cleaned[index - 1]) / 1000.0)
+        for index in range(1, len(cleaned))
+        if cleaned[index] > cleaned[index - 1]
+    ]
+    median_interval_sec = _percentile(intervals_sec, 0.5) if intervals_sec else None
+    approx_gap_count = 0
+    if median_interval_sec is not None and median_interval_sec > 0.0:
+        for interval_sec in intervals_sec:
+            if interval_sec <= (median_interval_sec * 1.5):
+                continue
+            approx_gap_count += max(1, int(round(interval_sec / median_interval_sec)) - 1)
+
+    row = {
+        "stream": stream_name,
+        "sample_count": len(cleaned),
+        "start_utc": _iso_utc(cleaned[0]) if cleaned else None,
+        "end_utc": _iso_utc(cleaned[-1]) if cleaned else None,
+        "duration_sec": ((cleaned[-1] - cleaned[0]) / 1000.0) if len(cleaned) >= 2 else 0.0,
+        "mean_interval_sec": mean(intervals_sec) if intervals_sec else None,
+        "median_interval_sec": median_interval_sec,
+        "p95_interval_sec": _percentile(intervals_sec, 0.95) if intervals_sec else None,
+        "max_interval_sec": max(intervals_sec) if intervals_sec else None,
+        "interval_std_sec": pstdev(intervals_sec) if len(intervals_sec) > 1 else 0.0 if intervals_sec else None,
+        "approx_gap_count": approx_gap_count,
+        "notes": "approx_gap_count is an interval-gap estimate, not true packet loss",
+    }
+    if fresh_values is not None:
+        fresh_clean = [value for value in fresh_values if value is not None]
+        row["fresh_true_ratio"] = (
+            sum(1 for value in fresh_clean if value is True) / len(fresh_clean)
+            if fresh_clean else None
+        )
+    if applied_values is not None:
+        applied_clean = [value for value in applied_values if value is not None]
+        row["applied_true_ratio"] = (
+            sum(1 for value in applied_clean if value is True) / len(applied_clean)
+            if applied_clean else None
+        )
+    return row
+
+
+def _build_stream_timing_rows(system_rows: List[dict], prediction_rows: List[dict]) -> List[dict]:
+    rows: List[dict] = []
+    rows.append(_series_timing_row("telemetry", [int(row["ts"]) for row in system_rows]))
+    rows.append(
+        _series_timing_row(
+            "prediction_short",
+            [
+                int(row["ts"])
+                for row in prediction_rows
+                if row.get("pred_short_power_w") is not None or row.get("pred_short_window_energy_wh") is not None
+            ],
+            fresh_values=[_safe_bool(row.get("short_fresh")) for row in system_rows],
+            applied_values=[_safe_bool(row.get("short_applied")) for row in system_rows],
+        )
+    )
+    rows.append(
+        _series_timing_row(
+            "prediction_long_rf",
+            [
+                int(row["ts"])
+                for row in prediction_rows
+                if row.get("pred_long_rf_power_w") is not None or row.get("pred_long_rf_window_energy_wh") is not None
+            ],
+            fresh_values=[_safe_bool(row.get("rf_fresh")) for row in system_rows],
+            applied_values=[_safe_bool(row.get("rf_applied")) for row in system_rows],
+        )
+    )
+    rows.append(
+        _series_timing_row(
+            "prediction_long_lstm",
+            [
+                int(row["ts"])
+                for row in prediction_rows
+                if row.get("pred_long_lstm_power_w") is not None or row.get("pred_long_lstm_window_energy_wh") is not None
+            ],
+            fresh_values=[_safe_bool(row.get("lstm_fresh")) for row in system_rows],
+            applied_values=[_safe_bool(row.get("lstm_applied")) for row in system_rows],
+        )
+    )
+    return rows
+
+
+def _build_policy_control_action_rows(system_rows: List[dict]) -> List[dict]:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for row in system_rows:
+        grouped[str(row.get("control_policy") or "UNKNOWN")].append(row)
+
+    order = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY", "HYBRID", "AI_PREFERRED"]
+    rows: List[dict] = []
+    seen = set()
+    for policy in order + sorted(grouped.keys()):
+        if policy not in grouped or policy in seen:
+            continue
+        seen.add(policy)
+        policy_rows = grouped[policy]
+        shedding_delta = _field_delta(policy_rows, "shedding_event_count")
+        curtail_delta = _field_delta(policy_rows, "curtail_event_count")
+        restore_delta = _field_delta(policy_rows, "restore_event_count")
+        total_actions_delta = _field_delta(policy_rows, "total_control_actions")
+        if (total_actions_delta is None or total_actions_delta <= 0.0) and any(
+            value is not None for value in (shedding_delta, curtail_delta, restore_delta)
+        ):
+            total_actions_delta = sum(value or 0.0 for value in (shedding_delta, curtail_delta, restore_delta))
+        rows.append(
+            {
+                "control_policy": policy,
+                "sample_count": len(policy_rows),
+                "observation_duration_sec": max(0.0, (policy_rows[-1]["ts"] - policy_rows[0]["ts"]) / 1000.0) if len(policy_rows) >= 2 else 0.0,
+                "total_control_actions": total_actions_delta,
+                "shedding_event_count": shedding_delta,
+                "curtail_event_count": curtail_delta,
+                "restore_event_count": restore_delta,
+                "load_toggle_count": _field_delta(policy_rows, "load_toggle_count"),
+                "mean_control_actions_per_min": mean([
+                    value for value in (_safe_float(row.get("control_actions_per_min")) for row in policy_rows)
+                    if value is not None
+                ]) if any(_safe_float(row.get("control_actions_per_min")) is not None for row in policy_rows) else None,
+                "max_control_actions_per_min": max([
+                    value for value in (_safe_float(row.get("control_actions_per_min")) for row in policy_rows)
+                    if value is not None
+                ]) if any(_safe_float(row.get("control_actions_per_min")) is not None for row in policy_rows) else None,
+            }
+        )
+    return rows
+
+
+def _prediction_display_power_w(row: dict) -> Optional[float]:
+    for key in (
+        "predictor_predicted_power_w",
+        "rf_predicted_power_w",
+        "lstm_predicted_power_w",
+        "short_predicted_power_w",
+    ):
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _control_action_delta_row(row: dict, prev_row: Optional[dict]) -> dict:
+    keys = (
+        "total_control_actions",
+        "shedding_event_count",
+        "curtail_event_count",
+        "restore_event_count",
+        "load_toggle_count",
+    )
+    delta_row: Dict[str, float] = {}
+    total_delta = 0.0
+    for key in keys:
+        current = _safe_float(row.get(key)) or 0.0
+        previous = _safe_float(prev_row.get(key)) if prev_row is not None else 0.0
+        delta = max(0.0, current - (previous or 0.0))
+        delta_row[f"{key}_delta"] = delta
+        if key != "total_control_actions":
+            total_delta += delta
+    if total_delta <= 0.0:
+        total_delta = delta_row["total_control_actions_delta"]
+    delta_row["control_action_delta"] = total_delta
+    delta_row["control_action_active"] = total_delta > 0.0
+    return delta_row
+
+
+def _group_system_rows_by_policy(system_rows: Sequence[dict]) -> Dict[str, List[dict]]:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for row in system_rows:
+        grouped[str(row.get("control_policy") or "UNKNOWN")].append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda item: int(item["ts"]))
+    return grouped
+
+
+def _build_forecast_informed_control_response_rows(system_rows: List[dict]) -> List[dict]:
+    grouped = _group_system_rows_by_policy(system_rows)
+    rows: List[dict] = []
+    order = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY", "HYBRID", "AI_PREFERRED"]
+    seen = set()
+    for policy in order + sorted(grouped.keys()):
+        if policy in seen or policy not in grouped:
+            continue
+        seen.add(policy)
+        policy_rows = grouped[policy]
+        if not policy_rows:
+            continue
+        start_ts = int(policy_rows[0]["ts"])
+        prev_row: Optional[dict] = None
+        for row in policy_rows:
+            delta_row = _control_action_delta_row(row, prev_row)
+            rows.append(
+                {
+                    "ts": row["ts"],
+                    "label_utc": row["label_utc"],
+                    "control_policy": policy,
+                    "elapsed_min": max(0.0, (int(row["ts"]) - start_ts) / 60000.0),
+                    "actual_power_w": row.get("total_power_w"),
+                    "predicted_power_w": _prediction_display_power_w(row),
+                    "control_threshold_w": row.get("max_total_power_w"),
+                    "control_action_delta": delta_row["control_action_delta"],
+                    "control_action_active": delta_row["control_action_active"],
+                    "shedding_event_delta": delta_row["shedding_event_count_delta"],
+                    "curtail_event_delta": delta_row["curtail_event_count_delta"],
+                    "restore_event_delta": delta_row["restore_event_count_delta"],
+                    "load_toggle_delta": delta_row["load_toggle_count_delta"],
+                    "predictor_risk_level": row.get("predictor_risk_level"),
+                    "predictor_peak_risk": row.get("predictor_peak_risk"),
+                }
+            )
+            prev_row = row
+    return rows
+
+
+def _select_reference_window_minutes(rolling_window_minutes: Sequence[int]) -> Optional[int]:
+    cleaned = sorted({int(value) for value in rolling_window_minutes if int(value) > 0})
+    if not cleaned:
+        return None
+    if 30 in cleaned:
+        return 30
+    for candidate in (15, 60, 5, 1):
+        if candidate in cleaned:
+            return candidate
+    return cleaned[0]
+
+
+def _build_policy_rolling_energy_comparison_rows(
+    system_rows: List[dict],
+    rolling_window_minutes: Sequence[int],
+) -> List[dict]:
+    reference_window = _select_reference_window_minutes(rolling_window_minutes)
+    if reference_window is None:
+        return []
+    window_label = _rolling_window_label(int(reference_window))
+    grouped = _group_system_rows_by_policy(system_rows)
+    rows: List[dict] = []
+    order = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY", "HYBRID", "AI_PREFERRED"]
+    seen = set()
+    for policy in order + sorted(grouped.keys()):
+        if policy in seen or policy not in grouped:
+            continue
+        seen.add(policy)
+        policy_rows = grouped[policy]
+        if not policy_rows:
+            continue
+        start_ts = int(policy_rows[0]["ts"])
+        for row in policy_rows:
+            rows.append(
+                {
+                    "ts": row["ts"],
+                    "label_utc": row["label_utc"],
+                    "control_policy": policy,
+                    "elapsed_min": max(0.0, (int(row["ts"]) - start_ts) / 60000.0),
+                    "window_minutes": reference_window,
+                    "window_label": window_label,
+                    "rolling_energy_wh": row.get(f"rolling_energy_{window_label}_wh"),
+                    "rolling_avg_power_w": row.get(f"rolling_avg_power_{window_label}_w"),
+                }
+            )
+    return rows
+
+
+def _build_before_after_demand_profile_rows(system_rows: List[dict]) -> List[dict]:
+    grouped = _group_system_rows_by_policy(system_rows)
+    included = [policy for policy in ("NO_ENERGY_MANAGEMENT", "HYBRID", "AI_PREFERRED") if policy in grouped]
+    if not included and "RULE_ONLY" in grouped:
+        included = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY"]
+    rows: List[dict] = []
+    for policy in included:
+        policy_rows = grouped.get(policy) or []
+        if not policy_rows:
+            continue
+        start_ts = int(policy_rows[0]["ts"])
+        for row in policy_rows:
+            rows.append(
+                {
+                    "ts": row["ts"],
+                    "label_utc": row["label_utc"],
+                    "control_policy": policy,
+                    "elapsed_min": max(0.0, (int(row["ts"]) - start_ts) / 60000.0),
+                    "total_power_w": row.get("total_power_w"),
+                }
+            )
+    return rows
+
+
+def _process_transfer_success(policy_rows: Sequence[dict]) -> bool:
+    seen_transfer_1 = False
+    seen_transfer_2 = False
+    success = False
+    for row in policy_rows:
+        state = str(row.get("process_state") or "").upper()
+        if state == "TRANSFER_1_TO_2":
+            seen_transfer_1 = True
+        elif state == "TRANSFER_2_TO_1":
+            seen_transfer_2 = True
+        elif state == "HEAT_TANK2" and seen_transfer_1:
+            success = True
+        elif state in {"HEAT_TANK1", "IDLE"} and seen_transfer_2:
+            success = True
+    return success
+
+
+def _build_process_performance_rows(system_rows: List[dict], tank_rows: List[dict]) -> List[dict]:
+    grouped_system = _group_system_rows_by_policy(system_rows)
+    grouped_tanks: Dict[str, List[dict]] = defaultdict(list)
+    for row in tank_rows:
+        grouped_tanks[str(row.get("control_policy") or "UNKNOWN")].append(row)
+    for rows in grouped_tanks.values():
+        rows.sort(key=lambda item: int(item["ts"]))
+
+    policy_summary = {str(row.get("control_policy")): row for row in _build_policy_summary_rows(system_rows)}
+    rows: List[dict] = []
+    order = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY", "HYBRID", "AI_PREFERRED"]
+    seen = set()
+    for policy in order + sorted(grouped_system.keys()):
+        if policy in seen or policy not in grouped_system:
+            continue
+        seen.add(policy)
+        policy_rows = grouped_system[policy]
+        tank_policy_rows = grouped_tanks.get(policy) or []
+        summary_row = policy_summary.get(policy) or {}
+        target_temp_achieved = False
+        for row in tank_policy_rows:
+            tank1_temp = _safe_float(row.get("tank1_temp_c"))
+            tank1_target = _safe_float(row.get("tank1_target_temp_c"))
+            tank2_temp = _safe_float(row.get("tank2_temp_c"))
+            tank2_target = _safe_float(row.get("tank2_target_temp_c"))
+            if tank1_temp is not None and tank1_target is not None and tank1_temp >= tank1_target:
+                target_temp_achieved = True
+            if tank2_temp is not None and tank2_target is not None and tank2_temp >= tank2_target:
+                target_temp_achieved = True
+            if target_temp_achieved:
+                break
+        completed_cycles = _safe_float(summary_row.get("completed_cycle_delta")) or 0.0
+        transfer_success = completed_cycles > 0.0 or _process_transfer_success(policy_rows)
+        rows.append(
+            {
+                "control_policy": policy,
+                "cycle_completed": completed_cycles > 0.0,
+                "completed_cycle_count": completed_cycles,
+                "process_time_s": summary_row.get("process_time_s"),
+                "target_temperature_achieved": target_temp_achieved,
+                "transfer_success": transfer_success,
+            }
+        )
+    return rows
+
+
+def _build_prediction_residual_rows(model_label: str, comparison_rows: List[dict]) -> List[dict]:
+    rows: List[dict] = []
+    for row in comparison_rows:
+        actual_power = _safe_float(row.get("actual_rolling_avg_power_w"))
+        predicted_power = _safe_float(row.get("predicted_rolling_avg_power_w"))
+        actual_energy = _safe_float(row.get("actual_rolling_energy_wh"))
+        predicted_energy = _safe_float(row.get("predicted_rolling_energy_wh"))
+        if predicted_power is None and predicted_energy is None:
+            continue
+        rows.append(
+            {
+                "model": model_label,
+                "ts": row.get("ts"),
+                "label_utc": row.get("label_utc"),
+                "rolling_window_minutes": row.get("rolling_window_minutes"),
+                "actual_rolling_avg_power_w": actual_power,
+                "predicted_rolling_avg_power_w": predicted_power,
+                "power_residual_w": (predicted_power - actual_power) if predicted_power is not None and actual_power is not None else None,
+                "actual_rolling_energy_wh": actual_energy,
+                "predicted_rolling_energy_wh": predicted_energy,
+                "energy_residual_wh": (predicted_energy - actual_energy) if predicted_energy is not None and actual_energy is not None else None,
+            }
+        )
+    return rows
+
+
+def _control_risk_active(row: dict) -> bool:
+    if _safe_bool(row.get("peak_event")) is True:
+        return True
+    if _safe_bool(row.get("predictor_peak_risk")) is True:
+        return True
+    risk_level = str(row.get("predictor_risk_level") or "").upper()
+    if risk_level == "HIGH":
+        return True
+    total_power_w = _safe_float(row.get("total_power_w"))
+    max_total_power_w = _safe_float(row.get("max_total_power_w"))
+    return bool(
+        total_power_w is not None
+        and max_total_power_w is not None
+        and max_total_power_w > 0.0
+        and total_power_w >= (max_total_power_w * 0.98)
+    )
+
+
+def _control_counter_snapshot(row: dict) -> Tuple[float, float, float, float]:
+    return (
+        _safe_float(row.get("total_control_actions")) or 0.0,
+        _safe_float(row.get("shedding_event_count")) or 0.0,
+        _safe_float(row.get("curtail_event_count")) or 0.0,
+        _safe_float(row.get("restore_event_count")) or 0.0,
+    )
+
+
+def _control_counters_changed(row: dict, baseline: Tuple[float, float, float, float]) -> bool:
+    current = _control_counter_snapshot(row)
+    return any(current[index] > baseline[index] for index in range(len(baseline)))
+
+
+def _build_control_response_metrics_rows(system_rows: List[dict]) -> List[dict]:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for row in system_rows:
+        grouped[str(row.get("control_policy") or "UNKNOWN")].append(row)
+
+    rows: List[dict] = []
+    order = ["NO_ENERGY_MANAGEMENT", "RULE_ONLY", "HYBRID", "AI_PREFERRED"]
+    seen = set()
+    for policy in order + sorted(grouped.keys()):
+        if policy not in grouped or policy in seen:
+            continue
+        seen.add(policy)
+        policy_rows = sorted(grouped[policy], key=lambda item: item["ts"])
+        action_delays_sec: List[float] = []
+        clearance_delays_sec: List[float] = []
+        risk_onset_count = 0
+        previous_risk = False
+        for index, row in enumerate(policy_rows):
+            risk_active = _control_risk_active(row)
+            if risk_active and not previous_risk:
+                risk_onset_count += 1
+                onset_ts = int(row["ts"])
+                baseline = _control_counter_snapshot(row)
+                for follow in policy_rows[index + 1:]:
+                    if _control_counters_changed(follow, baseline):
+                        action_delays_sec.append(max(0.0, (int(follow["ts"]) - onset_ts) / 1000.0))
+                        break
+                    if not _control_risk_active(follow):
+                        break
+                cap_w = _safe_float(row.get("max_total_power_w"))
+                if cap_w is not None and cap_w > 0.0:
+                    for follow in policy_rows[index:]:
+                        total_power_w = _safe_float(follow.get("total_power_w"))
+                        if total_power_w is not None and total_power_w <= cap_w:
+                            clearance_delays_sec.append(max(0.0, (int(follow["ts"]) - onset_ts) / 1000.0))
+                            break
+            previous_risk = risk_active
+
+        settling_values = [
+            value for value in (_safe_float(row.get("last_peak_settling_time_sec")) for row in policy_rows)
+            if value is not None and value > 0.0
+        ]
+        overshoot_values = [
+            value for value in (_safe_float(row.get("max_overshoot_w")) for row in policy_rows)
+            if value is not None
+        ]
+        rows.append(
+            {
+                "control_policy": policy,
+                "sample_count": len(policy_rows),
+                "risk_onset_count": risk_onset_count,
+                "mean_first_control_action_delay_sec": mean(action_delays_sec) if action_delays_sec else None,
+                "p95_first_control_action_delay_sec": _percentile(action_delays_sec, 0.95) if action_delays_sec else None,
+                "mean_threshold_clearance_delay_sec": mean(clearance_delays_sec) if clearance_delays_sec else None,
+                "p95_threshold_clearance_delay_sec": _percentile(clearance_delays_sec, 0.95) if clearance_delays_sec else None,
+                "mean_peak_settling_time_sec": mean(settling_values) if settling_values else None,
+                "p95_peak_settling_time_sec": _percentile(settling_values, 0.95) if settling_values else None,
+                "max_recorded_overshoot_w": max(overshoot_values) if overshoot_values else None,
+                "overshoot_event_count": _field_delta(policy_rows, "overshoot_event_count"),
+            }
+        )
+    return rows
+
+
+def _command_kind(payload: dict, topic: str) -> str:
+    if topic == TOPIC_PREDICTOR_CMD_NAME:
+        return "predictor_short_cmd"
+    if topic == TOPIC_PREDICTOR_LONG_CMD_NAME:
+        return "predictor_long_rf_cmd"
+    if topic == TOPIC_PREDICTOR_LONG_LSTM_CMD_NAME:
+        return "predictor_long_lstm_cmd"
+    if not isinstance(payload, dict):
+        return "unknown"
+    if payload.get("device") is not None:
+        return "device_set"
+    if payload.get("control_policy") is not None:
+        return "control_policy"
+    if payload.get("predictor_mode") is not None or payload.get("PREDICTOR_MODE") is not None:
+        return "predictor_mode"
+    if payload.get("process") is not None:
+        return "process"
+    if payload.get("control") is not None:
+        return "control_update"
+    if payload.get("scene") is not None:
+        return "scene"
+    return "other"
+
+
+def _command_key(payload: dict) -> str:
+    try:
+        return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(payload)
+
+
+def _build_command_latency_rows(command_rows: List[dict], command_ack_rows: List[dict]) -> List[dict]:
+    pending: Dict[str, deque] = defaultdict(deque)
+    for row in command_rows:
+        pending[_command_key(row.get("payload") or {})].append(row)
+
+    rows: List[dict] = []
+    for ack_row in command_ack_rows:
+        payload = ack_row.get("payload") or {}
+        ack_body = payload.get("ack") if isinstance(payload.get("ack"), dict) else {}
+        cmd_body = payload.get("cmd") if isinstance(payload.get("cmd"), dict) else {}
+        key = _command_key(cmd_body)
+        command_row = pending[key].popleft() if pending.get(key) else None
+        if command_row is None:
+            continue
+        latency_ms = max(0.0, float(ack_row["ts"]) - float(command_row["ts"]))
+        rows.append(
+            {
+                "command_type": _command_kind(cmd_body, command_row.get("topic") or TOPIC_COMMAND_NAME),
+                "command_label": cmd_body.get("device") or cmd_body.get("control_policy") or cmd_body.get("predictor_mode") or cmd_body.get("PREDICTOR_MODE") or "",
+                "command_logged_at_utc": command_row.get("label_utc"),
+                "ack_logged_at_utc": ack_row.get("label_utc"),
+                "publish_to_ack_ms_approx": latency_ms,
+                "ack_ok": _safe_bool(ack_body.get("ok")),
+                "ack_msg": ack_body.get("msg"),
+            }
+        )
+    return rows
+
+
+def _build_command_latency_summary_rows(command_latency_rows: List[dict]) -> List[dict]:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for row in command_latency_rows:
+        grouped[str(row.get("command_type") or "unknown")].append(row)
+
+    rows: List[dict] = []
+    for command_type in sorted(grouped.keys()):
+        items = grouped[command_type]
+        latencies = [
+            value for value in (_safe_float(row.get("publish_to_ack_ms_approx")) for row in items)
+            if value is not None
+        ]
+        ack_flags = [value for value in (_safe_bool(row.get("ack_ok")) for row in items) if value is not None]
+        rows.append(
+            {
+                "command_type": command_type,
+                "count": len(items),
+                "mean_publish_to_ack_ms_approx": mean(latencies) if latencies else None,
+                "p50_publish_to_ack_ms_approx": _percentile(latencies, 0.5) if latencies else None,
+                "p95_publish_to_ack_ms_approx": _percentile(latencies, 0.95) if latencies else None,
+                "max_publish_to_ack_ms_approx": max(latencies) if latencies else None,
+                "ack_ok_ratio": (sum(1 for flag in ack_flags if flag is True) / len(ack_flags)) if ack_flags else None,
+                "notes": "Approximate broker-observed command-to-ack latency based on logger timestamps",
+            }
+        )
+    return rows
+
+
+def _build_step_timing_rows(run_metadata: Optional[Dict[str, object]]) -> List[dict]:
+    if not isinstance(run_metadata, dict):
+        return []
+    rows: List[dict] = []
+    for step in list(run_metadata.get("plan") or []):
+        if not isinstance(step, dict):
+            continue
+        started_ms = _parse_epoch_ms(step.get("started_at"))
+        completed_ms = _parse_epoch_ms(step.get("completed_at"))
+        rows.append(
+            {
+                "step_id": step.get("id"),
+                "action": step.get("action"),
+                "label": step.get("label"),
+                "status": step.get("status"),
+                "planned_duration_sec": _safe_float(step.get("duration_sec")),
+                "actual_duration_sec": ((completed_ms - started_ms) / 1000.0) if started_ms is not None and completed_ms is not None else None,
+                "started_at": step.get("started_at"),
+                "completed_at": step.get("completed_at"),
+            }
+        )
+    return rows
+
+
+def _build_run_timing_summary_rows(run_metadata: Optional[Dict[str, object]], step_rows: List[dict]) -> List[dict]:
+    if not isinstance(run_metadata, dict):
+        return []
+    started_ms = _parse_epoch_ms(run_metadata.get("started_at"))
+    finished_ms = _parse_epoch_ms(run_metadata.get("finished_at"))
+    actual_step_durations = [
+        value for value in (_safe_float(row.get("actual_duration_sec")) for row in step_rows)
+        if value is not None
+    ]
+    return [
+        {
+            "run_id": run_metadata.get("id"),
+            "template_id": run_metadata.get("template_id"),
+            "status": run_metadata.get("status"),
+            "started_at": run_metadata.get("started_at"),
+            "finished_at": run_metadata.get("finished_at"),
+            "total_duration_sec": ((finished_ms - started_ms) / 1000.0) if started_ms is not None and finished_ms is not None else None,
+            "step_count": len(step_rows),
+            "mean_step_duration_sec": mean(actual_step_durations) if actual_step_durations else None,
+            "p95_step_duration_sec": _percentile(actual_step_durations, 0.95) if actual_step_durations else None,
+        }
+    ]
+
+
+def _build_observability_notes(
+    stream_timing_rows: List[dict],
+    command_latency_rows: List[dict],
+    step_rows: List[dict],
+) -> str:
+    telemetry_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "telemetry"), None)
+    telemetry_median = telemetry_row.get("median_interval_sec") if telemetry_row else None
+    command_supported = bool(command_latency_rows)
+    step_supported = bool(step_rows)
+    lines = [
+        "# IoT Observability Notes",
+        "",
+        "Measured directly:",
+        "- Telemetry and predictor stream cadence, jitter, and approximate gap counts from logged timestamps.",
+        "- Predictor freshness/applied ratios from telemetry `system.prediction_sources.*` state.",
+        "- Control-action counts and response metrics from telemetry `evaluation.control` / `evaluation.stability` fields.",
+    ]
+    if command_supported:
+        lines.append("- Approximate command-to-ack latency from logger-observed `cmd` and `cmd_ack` timestamps.")
+    else:
+        lines.append("- Command-to-ack latency is unavailable in this export because `cmd` / `cmd_ack` topics were not present in the source logs.")
+    if step_supported:
+        lines.append("- Experiment step timing from run orchestration events.")
+    lines.extend(
+        [
+            "",
+            "Not directly measurable from current logs:",
+            "- True MQTT packet loss. `approx_gap_count` is only a cadence-gap estimate.",
+            "- Exact frontend-to-broker-to-ESP32 latency and exact ESP32 receive timestamp.",
+            "- Exact predictor inference latency unless predictor runtimes publish dedicated timing fields.",
+            "",
+            f"Observed telemetry median interval: {telemetry_median if telemetry_median is not None else 'n/a'} sec.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _build_scalability_notes(
+    data: dict,
+    stream_timing_rows: List[dict],
+    rolling_window_minutes: Sequence[int],
+) -> str:
+    system_rows = data.get("system_rows") or []
+    load_rows = data.get("load_rows") or []
+    unique_loads = sorted({str(row.get("load_name") or "") for row in load_rows if row.get("load_name")})
+    telemetry_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "telemetry"), {})
+    lines = [
+        "# Scalability Considerations",
+        "",
+        f"- Telemetry samples exported: {len(system_rows)}",
+        f"- Per-load samples exported: {len(load_rows)}",
+        f"- Unique loads observed: {len(unique_loads)} ({', '.join(unique_loads) if unique_loads else 'n/a'})",
+        f"- Rolling windows exported: {', '.join(str(int(value)) for value in rolling_window_minutes)} minute(s)",
+        f"- Telemetry median interval: {telemetry_row.get('median_interval_sec', 'n/a')} sec",
+        f"- Telemetry p95 interval: {telemetry_row.get('p95_interval_sec', 'n/a')} sec",
+        "",
+        "Engineering notes:",
+        "- Export processing is linear in the number of JSONL records scanned for the selected run window.",
+        "- Additional rolling windows and per-load exports increase CPU and CSV volume but do not change the underlying telemetry cadence.",
+        "- If tighter latency analysis is required, keep command/ack logging enabled and avoid over-aggregating the logger cadence.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _build_timing_diagram(
+    stream_timing_rows: List[dict],
+    command_latency_summary_rows: List[dict],
+) -> str:
+    telemetry_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "telemetry"), {})
+    rf_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "prediction_long_rf"), {})
+    lstm_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "prediction_long_lstm"), {})
+    short_row = next((row for row in stream_timing_rows if str(row.get("stream")) == "prediction_short"), {})
+    all_ack_latencies = [
+        _safe_float(row.get("p50_publish_to_ack_ms_approx"))
+        for row in command_latency_summary_rows
+        if _safe_float(row.get("p50_publish_to_ack_ms_approx")) is not None
+    ]
+    ack_note = f"Approx cmd->ack p50: {min(all_ack_latencies):.1f} ms" if all_ack_latencies else "Approx cmd->ack latency: unavailable"
+    lines = [
+        "sequenceDiagram",
+        "    autonumber",
+        "    participant UI as Frontend/Admin UI",
+        "    participant MQTT as MQTT Broker",
+        "    participant ESP as ESP32 Controller",
+        "    participant PRED as Predictors (EMA/RF/LSTM)",
+        "    participant LOG as Telemetry Logger / History API",
+        f"    Note over UI,ESP: {ack_note}",
+        f"    Note over ESP,LOG: Telemetry median interval ~ {telemetry_row.get('median_interval_sec', 'n/a')} s",
+        f"    Note over PRED,LOG: EMA median ~ {short_row.get('median_interval_sec', 'n/a')} s; RF median ~ {rf_row.get('median_interval_sec', 'n/a')} s; LSTM median ~ {lstm_row.get('median_interval_sec', 'n/a')} s",
+        "    UI->>MQTT: publish dt/<plant>/cmd",
+        "    MQTT->>ESP: deliver command",
+        "    ESP-->>MQTT: cmd_ack",
+        "    ESP-->>MQTT: telemetry",
+        "    PRED-->>MQTT: prediction topics",
+        "    MQTT-->>LOG: persisted to JSONL",
+        "    LOG-->>UI: export-ready artefacts",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _build_supply_voltage_summary(system_rows: List[dict], event_rows: List[dict]) -> List[dict]:
     supply_values = [row["supply_v"] for row in system_rows if row.get("supply_v") is not None]
     total_current_values = [row["total_current_a"] for row in system_rows if row.get("total_current_a") is not None]
@@ -953,6 +2007,166 @@ def _build_voltage_events(system_rows: List[dict]) -> List[dict]:
     return events
 
 
+def _build_rolling_window_rows(system_rows: List[dict], rolling_window_minutes: Optional[Sequence[int]] = None) -> List[dict]:
+    rows: List[dict] = []
+    window_minutes_list = list(rolling_window_minutes or ROLLING_WINDOW_MINUTES)
+    for row in system_rows:
+        for window_minutes in window_minutes_list:
+            window_label = _rolling_window_label(int(window_minutes))
+            rows.append(
+                {
+                    "ts": row["ts"],
+                    "label_utc": row["label_utc"],
+                    "window_minutes": int(window_minutes),
+                    "window_label": window_label,
+                    "rolling_energy_wh": row.get(f"rolling_energy_{window_label}_wh"),
+                    "rolling_avg_power_w": row.get(f"rolling_avg_power_{window_label}_w"),
+                    "rolling_cost": row.get(f"rolling_cost_{window_label}"),
+                    "total_energy_wh": row.get("total_energy_wh"),
+                    "accumulated_energy_cost": row.get("accumulated_energy_cost"),
+                    "total_cost": row.get("total_cost"),
+                    "control_policy": row.get("control_policy"),
+                    "process_state": row.get("process_state"),
+                    "cost_tariff_state": row.get("cost_tariff_state"),
+                }
+            )
+    return rows
+
+
+def _build_rolling_and_cumulative_energy_rows(rolling_window_rows: Sequence[dict]) -> List[dict]:
+    return [
+        {
+            "ts": row.get("ts"),
+            "label_utc": row.get("label_utc"),
+            "window_minutes": row.get("window_minutes"),
+            "window_label": row.get("window_label"),
+            "rolling_energy_wh": row.get("rolling_energy_wh"),
+            "rolling_avg_power_w": row.get("rolling_avg_power_w"),
+            "total_energy_wh": row.get("total_energy_wh"),
+            "control_policy": row.get("control_policy"),
+            "process_state": row.get("process_state"),
+        }
+        for row in rolling_window_rows
+    ]
+
+
+def _build_rolling_and_cumulative_cost_rows(rolling_window_rows: Sequence[dict]) -> List[dict]:
+    return [
+        {
+            "ts": row.get("ts"),
+            "label_utc": row.get("label_utc"),
+            "window_minutes": row.get("window_minutes"),
+            "window_label": row.get("window_label"),
+            "rolling_cost": row.get("rolling_cost"),
+            "accumulated_energy_cost": row.get("accumulated_energy_cost"),
+            "total_cost": row.get("total_cost"),
+            "control_policy": row.get("control_policy"),
+            "process_state": row.get("process_state"),
+            "cost_tariff_state": row.get("cost_tariff_state"),
+        }
+        for row in rolling_window_rows
+    ]
+
+
+def _attach_load_rolling_fields(load_rows: List[dict], rolling_window_minutes: Optional[Sequence[int]] = None) -> List[dict]:
+    if not load_rows:
+        return load_rows
+
+    by_load: Dict[str, List[dict]] = defaultdict(list)
+    for row in load_rows:
+        by_load[str(row.get("load_name") or "")].append(row)
+
+    for load_name, rows in by_load.items():
+        rows.sort(key=lambda item: int(item.get("ts") or 0))
+        previous_ts = None
+        previous_power_w = None
+        cumulative_energy_wh = 0.0
+        window_minutes_list = list(rolling_window_minutes or ROLLING_WINDOW_MINUTES)
+        rolling_specs = [(int(minutes), _rolling_window_label(int(minutes))) for minutes in window_minutes_list]
+        rolling_segments = {minutes: deque() for minutes, _ in rolling_specs}
+        rolling_energy_totals = {minutes: 0.0 for minutes, _ in rolling_specs}
+
+        for row in rows:
+            ts = int(row.get("ts") or 0)
+            power_w = _safe_float(row.get("power_w")) or 0.0
+            incremental_energy_wh = 0.0
+            if previous_ts is not None and ts > previous_ts:
+                dt_hours = (ts - previous_ts) / 3600000.0
+                reference_power_w = power_w
+                if previous_power_w is not None:
+                    reference_power_w = (float(previous_power_w) + power_w) * 0.5
+                incremental_energy_wh = max(0.0, reference_power_w * dt_hours)
+
+            cumulative_energy_wh += incremental_energy_wh
+            row["incremental_energy_wh"] = incremental_energy_wh
+            row["cumulative_energy_wh"] = cumulative_energy_wh
+
+            if previous_ts is not None and ts > previous_ts:
+                segment = {
+                    "start_ms": int(previous_ts),
+                    "end_ms": int(ts),
+                    "energy_wh": float(incremental_energy_wh),
+                }
+                for window_minutes, _ in rolling_specs:
+                    rolling_segments[window_minutes].append(segment)
+                    rolling_energy_totals[window_minutes] += float(incremental_energy_wh)
+
+            for window_minutes, window_label in rolling_specs:
+                window_queue = rolling_segments[window_minutes]
+                window_start_ms = ts - (window_minutes * 60000)
+                while window_queue and int(window_queue[0]["end_ms"]) <= window_start_ms:
+                    expired = window_queue.popleft()
+                    rolling_energy_totals[window_minutes] -= float(expired["energy_wh"])
+
+                window_energy_wh = float(rolling_energy_totals[window_minutes])
+                if window_queue:
+                    head = window_queue[0]
+                    head_start = int(head["start_ms"])
+                    head_end = int(head["end_ms"])
+                    if head_start < window_start_ms < head_end:
+                        head_span_ms = max(1, head_end - head_start)
+                        outside_ratio = (window_start_ms - head_start) / head_span_ms
+                        window_energy_wh -= float(head["energy_wh"]) * outside_ratio
+
+                window_energy_wh = max(0.0, window_energy_wh)
+                row[f"rolling_energy_{window_label}_wh"] = window_energy_wh
+                row[f"rolling_avg_power_{window_label}_w"] = window_energy_wh / (window_minutes / 60.0)
+
+            previous_ts = ts
+            previous_power_w = power_w
+
+    return load_rows
+
+
+def _build_per_load_rolling_rows(load_rows: List[dict], rolling_window_minutes: Optional[Sequence[int]] = None) -> List[dict]:
+    rows: List[dict] = []
+    window_minutes_list = list(rolling_window_minutes or ROLLING_WINDOW_MINUTES)
+    for row in load_rows:
+        for window_minutes in window_minutes_list:
+            window_label = _rolling_window_label(int(window_minutes))
+            rows.append(
+                {
+                    "ts": row.get("ts"),
+                    "label_utc": row.get("label_utc"),
+                    "load_name": row.get("load_name"),
+                    "load_type": row.get("load_type"),
+                    "class": row.get("class"),
+                    "priority": row.get("priority"),
+                    "window_minutes": int(window_minutes),
+                    "window_label": window_label,
+                    "power_w": row.get("power_w"),
+                    "current_a": row.get("current_a"),
+                    "incremental_energy_wh": row.get("incremental_energy_wh"),
+                    "cumulative_energy_wh": row.get("cumulative_energy_wh"),
+                    "rolling_energy_wh": row.get(f"rolling_energy_{window_label}_wh"),
+                    "rolling_avg_power_w": row.get(f"rolling_avg_power_{window_label}_w"),
+                    "on": row.get("on"),
+                    "duty_applied": row.get("duty_applied"),
+                }
+            )
+    return rows
+
+
 def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, prediction_step_sec: int) -> dict:
     system_rows: List[dict] = []
     env_rows: List[dict] = []
@@ -960,6 +2174,8 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
     load_rows: List[dict] = []
     fig_4_15_rows: List[dict] = []
     prediction_rows: Dict[int, dict] = {}
+    command_rows: List[dict] = []
+    command_ack_rows: List[dict] = []
     used_files = 0
     used_records = 0
 
@@ -977,8 +2193,7 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
                     record = json.loads(text)
                 except Exception:
                     continue
-                topic = str(record.get("topic") or "")
-                payload = record.get("payload")
+                topic, payload = _extract_logged_topic_payload(record if isinstance(record, dict) else {})
                 if not isinstance(payload, dict):
                     continue
 
@@ -1049,12 +2264,36 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
                         "short_fresh": _safe_bool(pred_short.get("fresh")),
                         "short_applied": _safe_bool(pred_short.get("applied")),
                         "short_predicted_power_w": _safe_float(pred_short.get("predicted_power_w")),
+                        "short_predicted_window_energy_wh": _safe_float(pred_short.get("predicted_window_energy_wh")) or _safe_float(pred_short.get("projected_energy_window_wh")),
+                        "short_predicted_total_energy_wh": _derive_predicted_total_energy(
+                            _safe_float(energy.get("total_energy_wh")),
+                            _safe_float(pred_short.get("predicted_power_w")),
+                            _safe_float(pred_short.get("predicted_total_energy_wh")) or _safe_float(pred_short.get("predicted_energy_wh")),
+                            _safe_float(pred_short.get("horizon_sec")),
+                        ),
+                        "short_horizon_sec": _safe_float(pred_short.get("horizon_sec")),
                         "rf_fresh": _safe_bool(pred_long_rf.get("fresh")),
                         "rf_applied": _safe_bool(pred_long_rf.get("applied")),
                         "rf_predicted_power_w": _safe_float(pred_long_rf.get("predicted_power_w")),
+                        "rf_predicted_window_energy_wh": _safe_float(pred_long_rf.get("predicted_window_energy_wh")) or _safe_float(pred_long_rf.get("projected_energy_window_wh")),
+                        "rf_predicted_total_energy_wh": _derive_predicted_total_energy(
+                            _safe_float(energy.get("total_energy_wh")),
+                            _safe_float(pred_long_rf.get("predicted_power_w")),
+                            _safe_float(pred_long_rf.get("predicted_total_energy_wh")) or _safe_float(pred_long_rf.get("predicted_energy_wh")),
+                            _safe_float(pred_long_rf.get("horizon_sec")),
+                        ),
+                        "rf_horizon_sec": _safe_float(pred_long_rf.get("horizon_sec")),
                         "lstm_fresh": _safe_bool(pred_long_lstm.get("fresh")),
                         "lstm_applied": _safe_bool(pred_long_lstm.get("applied")),
                         "lstm_predicted_power_w": _safe_float(pred_long_lstm.get("predicted_power_w")),
+                        "lstm_predicted_window_energy_wh": _safe_float(pred_long_lstm.get("predicted_window_energy_wh")) or _safe_float(pred_long_lstm.get("projected_energy_window_wh")),
+                        "lstm_predicted_total_energy_wh": _derive_predicted_total_energy(
+                            _safe_float(energy.get("total_energy_wh")),
+                            _safe_float(pred_long_lstm.get("predicted_power_w")),
+                            _safe_float(pred_long_lstm.get("predicted_total_energy_wh")) or _safe_float(pred_long_lstm.get("predicted_energy_wh")),
+                            _safe_float(pred_long_lstm.get("horizon_sec")),
+                        ),
+                        "lstm_horizon_sec": _safe_float(pred_long_lstm.get("horizon_sec")),
                     }
                     system_rows.append(system_row)
 
@@ -1074,6 +2313,7 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
                         {
                             "ts": ts_ms,
                             "label_utc": label_utc,
+                            "control_policy": system.get("control_policy"),
                             "process_state": process.get("state"),
                             "tank1_temp_c": _safe_float(_nested_value(tank1, "temperature_c") or process.get("tank1_temp_c")),
                             "tank2_temp_c": _safe_float(_nested_value(tank2, "temperature_c") or process.get("tank2_temp_c")),
@@ -1151,6 +2391,30 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
                     pred_row["actual_power_w"] = system_row["total_power_w"]
                     pred_row["actual_current_a"] = system_row["total_current_a"]
                     pred_row["actual_total_energy_wh"] = system_row["total_energy_wh"]
+                    if pred_row.get("pred_short_power_w") is None:
+                        pred_row["pred_short_power_w"] = system_row.get("short_predicted_power_w")
+                    if pred_row.get("pred_short_window_energy_wh") is None:
+                        pred_row["pred_short_window_energy_wh"] = system_row.get("short_predicted_window_energy_wh")
+                    if pred_row.get("pred_short_total_energy_wh") is None:
+                        pred_row["pred_short_total_energy_wh"] = system_row.get("short_predicted_total_energy_wh")
+                    if pred_row.get("pred_short_horizon_sec") is None:
+                        pred_row["pred_short_horizon_sec"] = system_row.get("short_horizon_sec")
+                    if pred_row.get("pred_long_rf_power_w") is None:
+                        pred_row["pred_long_rf_power_w"] = system_row.get("rf_predicted_power_w")
+                    if pred_row.get("pred_long_rf_window_energy_wh") is None:
+                        pred_row["pred_long_rf_window_energy_wh"] = system_row.get("rf_predicted_window_energy_wh")
+                    if pred_row.get("pred_long_rf_total_energy_wh") is None:
+                        pred_row["pred_long_rf_total_energy_wh"] = system_row.get("rf_predicted_total_energy_wh")
+                    if pred_row.get("pred_long_rf_horizon_sec") is None:
+                        pred_row["pred_long_rf_horizon_sec"] = system_row.get("rf_horizon_sec")
+                    if pred_row.get("pred_long_lstm_power_w") is None:
+                        pred_row["pred_long_lstm_power_w"] = system_row.get("lstm_predicted_power_w")
+                    if pred_row.get("pred_long_lstm_window_energy_wh") is None:
+                        pred_row["pred_long_lstm_window_energy_wh"] = system_row.get("lstm_predicted_window_energy_wh")
+                    if pred_row.get("pred_long_lstm_total_energy_wh") is None:
+                        pred_row["pred_long_lstm_total_energy_wh"] = system_row.get("lstm_predicted_total_energy_wh")
+                    if pred_row.get("pred_long_lstm_horizon_sec") is None:
+                        pred_row["pred_long_lstm_horizon_sec"] = system_row.get("lstm_horizon_sec")
                     continue
 
                 if topic in (TOPIC_PREDICTION_NAME, TOPIC_PREDICTION_LONG_NAME, TOPIC_PREDICTION_LONG_LSTM_NAME):
@@ -1165,18 +2429,58 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
                     bucket = _bucket_ms(target_ms, prediction_step_sec)
                     pred_row = prediction_rows.setdefault(bucket, _prediction_row(bucket))
                     pred_power = _safe_float(payload.get("predicted_power_w"))
+                    pred_window_energy = _safe_float(payload.get("predicted_window_energy_wh")) or _safe_float(payload.get("projected_energy_window_wh"))
                     pred_energy = _safe_float(payload.get("predicted_total_energy_wh"))
                     if pred_energy is None:
                         pred_energy = _safe_float(payload.get("predicted_energy_wh"))
                     if topic == TOPIC_PREDICTION_NAME:
                         pred_row["pred_short_power_w"] = pred_power
+                        pred_row["pred_short_window_energy_wh"] = pred_window_energy
                         pred_row["pred_short_total_energy_wh"] = pred_energy
+                        pred_row["pred_short_horizon_sec"] = horizon_sec
                     elif topic == TOPIC_PREDICTION_LONG_NAME:
                         pred_row["pred_long_rf_power_w"] = pred_power
+                        pred_row["pred_long_rf_window_energy_wh"] = pred_window_energy
                         pred_row["pred_long_rf_total_energy_wh"] = pred_energy
+                        pred_row["pred_long_rf_horizon_sec"] = horizon_sec
                     else:
                         pred_row["pred_long_lstm_power_w"] = pred_power
+                        pred_row["pred_long_lstm_window_energy_wh"] = pred_window_energy
                         pred_row["pred_long_lstm_total_energy_wh"] = pred_energy
+                        pred_row["pred_long_lstm_horizon_sec"] = horizon_sec
+                    continue
+
+                if topic == TOPIC_COMMAND_NAME:
+                    ts_ms = _parse_epoch_ms(record.get("logged_at_utc")) or _parse_epoch_ms(payload.get("timestamp"))
+                    if ts_ms is None or ts_ms < start_ms or ts_ms > end_ms:
+                        continue
+                    used_records += 1
+                    command_rows.append(
+                        {
+                            "ts": ts_ms,
+                            "label_utc": _iso_utc(ts_ms),
+                            "topic": topic,
+                            "payload": payload,
+                            "logged_at_utc": record.get("logged_at_utc"),
+                        }
+                    )
+                    continue
+
+                if topic == TOPIC_COMMAND_ACK_NAME:
+                    ts_ms = _parse_epoch_ms(record.get("logged_at_utc")) or _parse_epoch_ms(payload.get("timestamp"))
+                    if ts_ms is None or ts_ms < start_ms or ts_ms > end_ms:
+                        continue
+                    used_records += 1
+                    command_ack_rows.append(
+                        {
+                            "ts": ts_ms,
+                            "label_utc": _iso_utc(ts_ms),
+                            "topic": topic,
+                            "payload": payload,
+                            "logged_at_utc": record.get("logged_at_utc"),
+                        }
+                    )
+                    continue
 
     system_rows.sort(key=lambda row: row["ts"])
     env_rows.sort(key=lambda row: row["ts"])
@@ -1184,6 +2488,28 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
     load_rows.sort(key=lambda row: (row["load_name"], row["ts"]))
     fig_4_15_rows.sort(key=lambda row: row["ts"])
     prediction_row_list = [prediction_rows[key] for key in sorted(prediction_rows.keys())]
+    command_rows.sort(key=lambda row: row["ts"])
+    command_ack_rows.sort(key=lambda row: row["ts"])
+
+    for row in prediction_row_list:
+        row["pred_short_total_energy_wh"] = _derive_predicted_total_energy(
+            row.get("actual_total_energy_wh"),
+            row.get("pred_short_power_w"),
+            row.get("pred_short_total_energy_wh"),
+            row.get("pred_short_horizon_sec"),
+        )
+        row["pred_long_rf_total_energy_wh"] = _derive_predicted_total_energy(
+            row.get("actual_total_energy_wh"),
+            row.get("pred_long_rf_power_w"),
+            row.get("pred_long_rf_total_energy_wh"),
+            row.get("pred_long_rf_horizon_sec"),
+        )
+        row["pred_long_lstm_total_energy_wh"] = _derive_predicted_total_energy(
+            row.get("actual_total_energy_wh"),
+            row.get("pred_long_lstm_power_w"),
+            row.get("pred_long_lstm_total_energy_wh"),
+            row.get("pred_long_lstm_horizon_sec"),
+        )
 
     prediction_by_bucket = {row["ts"]: row for row in prediction_row_list}
     for row in system_rows:
@@ -1199,8 +2525,14 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
         row["lstm_predicted_total_energy_wh"] = pred_row.get("pred_long_lstm_total_energy_wh")
         row["predictor_predicted_total_energy_wh"] = _resolve_fused_predicted_energy(row)
 
+    export_rolling_window_minutes = _merge_rolling_window_minutes(
+        ROLLING_WINDOW_MINUTES,
+        _prediction_window_minutes(prediction_row_list),
+    )
+    load_rows = _attach_load_rolling_fields(load_rows, export_rolling_window_minutes)
+
     tariff_store = _load_tariff_store()
-    _attach_cost_fields(system_rows, tariff_store)
+    _attach_cost_fields(system_rows, tariff_store, export_rolling_window_minutes)
 
     return {
         "system_rows": system_rows,
@@ -1209,9 +2541,12 @@ def _collect_data(log_dir: Path, plant_id: str, start_ms: int, end_ms: int, pred
         "load_rows": load_rows,
         "fig_4_15_rows": fig_4_15_rows,
         "prediction_rows": prediction_row_list,
+        "command_rows": command_rows,
+        "command_ack_rows": command_ack_rows,
         "files_scanned": used_files,
         "records_used": used_records,
         "tariff_store": tariff_store,
+        "rolling_window_minutes": export_rolling_window_minutes,
     }
 
 
@@ -1222,6 +2557,7 @@ def _export_chapter4_files(data: dict, out_dir: Path, prediction_step_sec: int, 
     load_rows = data["load_rows"]
     fig_4_15_rows = data["fig_4_15_rows"]
     prediction_rows = data["prediction_rows"]
+    rolling_window_minutes = data.get("rolling_window_minutes") or ROLLING_WINDOW_MINUTES
     system_by_ts = {row["ts"]: row for row in system_rows}
     load_summary_by_ts = _build_ts_load_summary(load_rows)
 
@@ -1435,59 +2771,105 @@ def _export_chapter4_files(data: dict, out_dir: Path, prediction_step_sec: int, 
 
     table_4_1_rows = _build_full_load_summary(load_rows)
     event_rows = _build_voltage_events(system_rows)
+    rolling_window_rows = _build_rolling_window_rows(system_rows, rolling_window_minutes)
+    rolling_energy_rows = [
+        {
+            "ts": row.get("ts"),
+            "label_utc": row.get("label_utc"),
+            "window_minutes": row.get("window_minutes"),
+            "window_label": row.get("window_label"),
+            "rolling_energy_wh": row.get("rolling_energy_wh"),
+            "rolling_avg_power_w": row.get("rolling_avg_power_w"),
+            "control_policy": row.get("control_policy"),
+            "process_state": row.get("process_state"),
+            "cost_tariff_state": row.get("cost_tariff_state"),
+        }
+        for row in rolling_window_rows
+    ]
+    rolling_and_cumulative_energy_rows = _build_rolling_and_cumulative_energy_rows(rolling_window_rows)
+    rolling_cost_rows = [
+        {
+            "ts": row.get("ts"),
+            "label_utc": row.get("label_utc"),
+            "window_minutes": row.get("window_minutes"),
+            "window_label": row.get("window_label"),
+            "rolling_cost": row.get("rolling_cost"),
+            "control_policy": row.get("control_policy"),
+            "process_state": row.get("process_state"),
+            "cost_tariff_state": row.get("cost_tariff_state"),
+        }
+        for row in rolling_window_rows
+    ]
+    rolling_and_cumulative_cost_rows = _build_rolling_and_cumulative_cost_rows(rolling_window_rows)
+    per_load_rolling_rows = _build_per_load_rolling_rows(load_rows, rolling_window_minutes)
     table_4_2_rows = _build_supply_voltage_summary(system_rows, event_rows)
 
+    table_16_rows = _build_policy_summary_rows(system_rows)
+    control_activity_rows = _build_policy_control_action_rows(system_rows)
+    process_performance_rows = _build_process_performance_rows(system_rows, tank_rows)
+
+    fig_4_10_rows = _build_prediction_comparison_rows(
+        prediction_rows,
+        system_rows,
+        prediction_step_sec,
+        "pred_short_power_w",
+        "pred_short_window_energy_wh",
+        "pred_short_total_energy_wh",
+        "pred_short_horizon_sec",
+    )
+    fig_4_11_rows = _build_prediction_comparison_rows(
+        prediction_rows,
+        system_rows,
+        prediction_step_sec,
+        "pred_long_rf_power_w",
+        "pred_long_rf_window_energy_wh",
+        "pred_long_rf_total_energy_wh",
+        "pred_long_rf_horizon_sec",
+    )
+    fig_4_12_rows = _build_prediction_comparison_rows(
+        prediction_rows,
+        system_rows,
+        prediction_step_sec,
+        "pred_long_lstm_power_w",
+        "pred_long_lstm_window_energy_wh",
+        "pred_long_lstm_total_energy_wh",
+        "pred_long_lstm_horizon_sec",
+    )
+
     table_4_3_rows = []
-    for label, pred_col in (
-        ("EMA", "pred_short_power_w"),
-        ("RF", "pred_long_rf_power_w"),
-        ("LSTM", "pred_long_lstm_power_w"),
+    for label, rows in (
+        ("EMA", fig_4_10_rows),
+        ("RF", fig_4_11_rows),
+        ("LSTM", fig_4_12_rows),
     ):
-        metrics = _compute_model_metrics(prediction_rows, pred_col, prediction_step_sec, max_lag_sec)
+        metrics = _compute_model_metrics(rows, "actual_rolling_energy_wh", "predicted_rolling_energy_wh", prediction_step_sec, max_lag_sec)
+        horizon_sec = _summarize_horizon_sec(rows)
         table_4_3_rows.append(
             {
                 "model": label,
-                "target": "total_power_w",
+                "target": "rolling_energy_wh",
+                "comparison_group": "short_horizon_baseline" if label == "EMA" else "long_horizon_model",
+                "horizon_sec": horizon_sec,
+                "horizon_minutes": (horizon_sec / 60.0) if horizon_sec is not None else None,
                 "sample_count": metrics["sample_count"],
-                "mae_w": metrics["mae_w"],
-                "rmse_w": metrics["rmse_w"],
+                "mae_wh": metrics["mae_wh"],
+                "mse_wh2": metrics["mse_wh2"],
+                "rmse_wh": metrics["rmse_wh"],
+                "r_squared": metrics["r_squared"],
                 "lag_sec": metrics["lag_sec"],
                 "lag_eval_samples": metrics["lag_eval_samples"],
+                "lag_step_sec": metrics["metric_step_sec"],
             }
         )
-
-    table_16_rows = _build_policy_summary_rows(system_rows)
-
-    fig_4_10_rows = [
-        {
-            "ts": row["ts"],
-            "label_utc": row["label_utc"],
-            "actual_power_w": row.get("actual_power_w"),
-            "predicted_power_w": row.get("pred_short_power_w"),
-            "predicted_total_energy_wh": row.get("pred_short_total_energy_wh"),
-        }
-        for row in prediction_rows
-    ]
-    fig_4_11_rows = [
-        {
-            "ts": row["ts"],
-            "label_utc": row["label_utc"],
-            "actual_power_w": row.get("actual_power_w"),
-            "predicted_power_w": row.get("pred_long_rf_power_w"),
-            "predicted_total_energy_wh": row.get("pred_long_rf_total_energy_wh"),
-        }
-        for row in prediction_rows
-    ]
-    fig_4_12_rows = [
-        {
-            "ts": row["ts"],
-            "label_utc": row["label_utc"],
-            "actual_power_w": row.get("actual_power_w"),
-            "predicted_power_w": row.get("pred_long_lstm_power_w"),
-            "predicted_total_energy_wh": row.get("pred_long_lstm_total_energy_wh"),
-        }
-        for row in prediction_rows
-    ]
+    model_metrics_by_label = {str(row.get("model")): row for row in table_4_3_rows}
+    ema_metrics_rows = [model_metrics_by_label["EMA"]] if "EMA" in model_metrics_by_label else []
+    rf_metrics_rows = [model_metrics_by_label["RF"]] if "RF" in model_metrics_by_label else []
+    lstm_metrics_rows = [model_metrics_by_label["LSTM"]] if "LSTM" in model_metrics_by_label else []
+    prediction_residual_rows = (
+        _build_prediction_residual_rows("EMA", fig_4_10_rows)
+        + _build_prediction_residual_rows("RF", fig_4_11_rows)
+        + _build_prediction_residual_rows("LSTM", fig_4_12_rows)
+    )
 
     fig_4_18_rows = [
         {
@@ -1521,6 +2903,9 @@ def _export_chapter4_files(data: dict, out_dir: Path, prediction_step_sec: int, 
         }
         for row in table_16_rows
     ]
+    forecast_control_rows = _build_forecast_informed_control_response_rows(system_rows)
+    rolling_energy_policy_rows = _build_policy_rolling_energy_comparison_rows(system_rows, rolling_window_minutes)
+    before_after_demand_rows = _build_before_after_demand_profile_rows(system_rows)
 
     fig_4_21_rows = [
         {
@@ -1595,7 +2980,13 @@ def _export_chapter4_files(data: dict, out_dir: Path, prediction_step_sec: int, 
         ("table_4_1_per_load_full_load.csv", table_4_1_rows),
         ("table_4_2_supply_voltage_behaviour.csv", table_4_2_rows),
         ("table_4_3_model_performance_metrics.csv", table_4_3_rows),
+        ("ema_model_performance_metrics.csv", ema_metrics_rows),
+        ("rf_model_performance_metrics.csv", rf_metrics_rows),
+        ("lstm_model_performance_metrics.csv", lstm_metrics_rows),
         ("table_16_policy_performance_comparison.csv", table_16_rows),
+        ("control_activity_metrics_table.csv", control_activity_rows),
+        ("process_performance_table.csv", process_performance_rows),
+        ("policy_performance_summary_table.csv", table_16_rows),
         ("figure_4_1_load_voltage_vs_load_current.csv", fig_4_1_rows),
         ("figure_4_2_supply_voltage_vs_total_current.csv", fig_4_2_rows),
         ("figure_4_3_temperature_vs_time_heating.csv", fig_4_3_rows),
@@ -1616,7 +3007,17 @@ def _export_chapter4_files(data: dict, out_dir: Path, prediction_step_sec: int, 
         ("figure_4_19_peak_demand_comparison.csv", fig_4_19_rows),
         ("figure_4_20_energy_consumption_comparison.csv", fig_4_20_rows),
         ("figure_4_21_integrated_system_operation_timeline.csv", fig_4_21_rows),
+        ("forecast_informed_control_response.csv", forecast_control_rows),
+        ("rolling_energy_consumption_comparison.csv", rolling_energy_policy_rows),
+        ("before_vs_after_demand_profile.csv", before_after_demand_rows),
+        ("prediction_residuals.csv", prediction_residual_rows),
         ("accumulated_cost_over_time.csv", accumulated_cost_rows),
+        ("rolling_window_energy_cost.csv", rolling_window_rows),
+        ("rolling_energy_consumption.csv", rolling_energy_rows),
+        ("rolling_cost_consumption.csv", rolling_cost_rows),
+        ("rolling_and_cumulative_energy.csv", rolling_and_cumulative_energy_rows),
+        ("rolling_and_cumulative_cost.csv", rolling_and_cumulative_cost_rows),
+        ("per_load_rolling_energy.csv", per_load_rolling_rows),
         ("voltage_protection_events.csv", event_rows),
         ("system_timeseries_master.csv", system_rows),
         ("tank_timeseries_master.csv", tank_rows),
@@ -1638,6 +3039,99 @@ def _build_run_name(plant_id: str, start_ms: int, end_ms: int) -> str:
     return f"{plant_id}_{start_text}_{end_text}"
 
 
+def _copy_model_analytics(run_dir: Path) -> List[Path]:
+    written: List[Path] = []
+    analytics_dir = run_dir / "model_analytics"
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    source_dirs: List[Path] = []
+    for raw_dir in (RF_MODEL_DIR_ENV, LSTM_MODEL_DIR_ENV):
+        if not raw_dir:
+            continue
+        candidate = Path(raw_dir).expanduser().resolve()
+        if candidate.exists() and candidate not in source_dirs:
+            source_dirs.append(candidate)
+    root_candidates = [Path(__file__).resolve().parent, Path.cwd().resolve()]
+    for root in list(root_candidates):
+        for parent in (root.parent, root.parent.parent):
+            if parent.exists() and parent not in root_candidates:
+                root_candidates.append(parent)
+    for model_type, hints in MODEL_SERVICE_DIR_HINTS.items():
+        for root in root_candidates:
+            for service_name in hints:
+                for candidate in (
+                    root / service_name / "shared" / "models",
+                    root / service_name / "current" / "models",
+                    root / service_name / "models",
+                ):
+                    if candidate.exists() and candidate not in source_dirs:
+                        source_dirs.append(candidate)
+    if MODEL_DIR.exists() and MODEL_DIR not in source_dirs:
+        source_dirs.append(MODEL_DIR)
+    copied_names = set()
+    for source_dir in source_dirs:
+        for source in sorted(source_dir.glob("*.analytics.json")):
+            if source.name in copied_names:
+                continue
+            target = analytics_dir / source.name
+            shutil.copy2(source, target)
+            copied_names.add(source.name)
+            written.append(target)
+    return written
+
+
+def _write_operational_exports(run_dir: Path, data: dict, run_metadata: Optional[Dict[str, object]]) -> List[Path]:
+    written: List[Path] = []
+    stream_timing_rows = _build_stream_timing_rows(data.get("system_rows") or [], data.get("prediction_rows") or [])
+    policy_control_action_rows = _build_policy_control_action_rows(data.get("system_rows") or [])
+    control_response_rows = _build_control_response_metrics_rows(data.get("system_rows") or [])
+    step_timing_rows = _build_step_timing_rows(run_metadata)
+    run_timing_summary_rows = _build_run_timing_summary_rows(run_metadata, step_timing_rows)
+    command_latency_rows = _build_command_latency_rows(data.get("command_rows") or [], data.get("command_ack_rows") or [])
+    command_latency_summary_rows = _build_command_latency_summary_rows(command_latency_rows)
+
+    csv_exports = [
+        ("telemetry_stream_timing.csv", stream_timing_rows),
+        ("policy_control_action_comparison.csv", policy_control_action_rows),
+        ("control_response_metrics.csv", control_response_rows),
+        ("experiment_step_timing.csv", step_timing_rows),
+        ("experiment_run_timing_summary.csv", run_timing_summary_rows),
+        ("command_ack_latency.csv", command_latency_rows),
+        ("command_ack_latency_summary.csv", command_latency_summary_rows),
+    ]
+    for filename, rows in csv_exports:
+        path = run_dir / filename
+        _write_csv(path, rows)
+        written.append(path)
+
+    notes_path = run_dir / "iot_observability_notes.md"
+    notes_path.write_text(
+        _build_observability_notes(stream_timing_rows, command_latency_rows, step_timing_rows),
+        encoding="utf-8",
+    )
+    written.append(notes_path)
+
+    scalability_path = run_dir / "scalability_considerations.md"
+    scalability_path.write_text(
+        _build_scalability_notes(data, stream_timing_rows, data.get("rolling_window_minutes") or ROLLING_WINDOW_MINUTES),
+        encoding="utf-8",
+    )
+    written.append(scalability_path)
+
+    timing_diagram_path = run_dir / "data_flow_timing_diagram.mmd"
+    timing_diagram_path.write_text(
+        _build_timing_diagram(stream_timing_rows, command_latency_summary_rows),
+        encoding="utf-8",
+    )
+    written.append(timing_diagram_path)
+
+    if isinstance(run_metadata, dict):
+        run_metadata_path = run_dir / "experiment_run.json"
+        run_metadata_path.write_text(json.dumps(run_metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        written.append(run_metadata_path)
+
+    return written
+
+
 def export_chapter4_dataset(
     *,
     log_dir,
@@ -1647,6 +3141,7 @@ def export_chapter4_dataset(
     end_ms: Optional[int] = None,
     prediction_step_sec: int = 5,
     max_lag_sec: int = 600,
+    run_metadata: Optional[Dict[str, object]] = None,
 ) -> dict:
     log_dir_path = Path(log_dir)
     out_dir_path = Path(out_dir)
@@ -1654,7 +3149,12 @@ def export_chapter4_dataset(
     data = _collect_data(log_dir_path, plant_id, start_ms, end_ms, prediction_step_sec)
     run_dir = out_dir_path / _build_run_name(plant_id, start_ms, end_ms)
     written = _export_chapter4_files(data, run_dir, prediction_step_sec, max_lag_sec)
+    auxiliary_written = _write_operational_exports(run_dir, data, run_metadata)
+    analytics_written = _copy_model_analytics(run_dir)
     row_counts = {path.name: _csv_row_count(path) for _, path in written}
+    for path in auxiliary_written:
+        if path.suffix.lower() == ".csv":
+            row_counts[path.name] = _csv_row_count(path)
 
     summary_path = run_dir / "export_summary.txt"
     summary_lines = [
@@ -1668,6 +3168,16 @@ def export_chapter4_dataset(
         "written_files:",
     ]
     summary_lines.extend(f"- {path.name} rows={row_counts.get(path.name, 0)}" for _, path in written)
+    if auxiliary_written:
+        summary_lines.extend(["", "auxiliary_files:"])
+        for path in auxiliary_written:
+            if path.suffix.lower() == ".csv":
+                summary_lines.append(f"- {path.name} rows={row_counts.get(path.name, 0)}")
+            else:
+                summary_lines.append(f"- {path.name}")
+    if analytics_written:
+        summary_lines.extend(["", "model_analytics:"])
+        summary_lines.extend(f"- {path.relative_to(run_dir)}" for path in analytics_written)
     empty_files = [name for name, count in row_counts.items() if count == 0]
     if empty_files:
         summary_lines.extend(["", "empty_files:"])
@@ -1684,6 +3194,8 @@ def export_chapter4_dataset(
         "files_scanned": data["files_scanned"],
         "records_used": data["records_used"],
         "written": written,
+        "auxiliary_written": auxiliary_written,
+        "analytics_written": analytics_written,
         "row_counts": row_counts,
         "summary_path": summary_path,
     }
